@@ -1,0 +1,255 @@
+"""
+losses/HiDF_explanation.py — L_exp + faithfulness utilities.
+
+v3 patch — all-three-metrics fix:
+  [mt_std]         loss_sharp now operates on M_t_logits (pre-softmax raw
+                   scores) not on M_t (softmax). Softmax over 49 cells has a
+                   hard ceiling of std≈0.141 — below the 0.15 threshold. Raw
+                   logits have no ceiling. Caller (train_real) passes out.M_t_logits.
+
+  [peak_mode_share] PeakSpreadLoss replaced with HardAttentionDiversityLoss.
+                   Old loss used entropy of batch-average which could be
+                   satisfied even under mode collapse. New loss computes
+                   batch-level popularity per cell (how many samples peak at
+                   each location) and penalises concentration — directly
+                   attacks peak_mode_share. Based on UNITE CVPR-2025 AD-loss.
+
+  [fake_acc]       No change here — handled via focal_alpha in train_real.
+
+  [faithfulness]   Unchanged from v2 — B-pass no_grad removed in train_real.
+"""
+
+import math as _math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+from torchvision.transforms import functional as TF
+
+
+# ── Output dataclass ──────────────────────────────────────────────────────────
+
+@dataclass
+class ExplanationLossOutput:
+    loss:             torch.Tensor
+    l_h:              float   # entropy term
+    l_tv:             float   # total-variation term
+    l_div:            float   # inter-sample JS-divergence term
+    inter_sample_sim: float   # mean pairwise cosine similarity (diagnostic)
+
+
+# ── Main explanation loss (entropy + TV + JS-div) ─────────────────────────────
+
+class ExplanationLoss(nn.Module):
+    """Weakly-supervised explanation loss — no GT masks required."""
+    def __init__(self, alpha: float = 0.2, beta: float = 0.5,
+                 diversity_weight: float = 4.0):
+        super().__init__()
+        self.alpha            = alpha
+        self.beta             = beta
+        self.diversity_weight = diversity_weight
+
+    def forward(self, M_t: torch.Tensor) -> ExplanationLossOutput:
+        """M_t : (B, T, h, w) — softmax maps, sums to 1 per (b,t)"""
+        B, T, h, w = M_t.shape
+        loss = M_t.new_zeros(1).squeeze()
+        l_h_acc  = 0.0
+        l_tv_acc = 0.0
+
+        for i in range(B):
+            m_avg = M_t[i].mean(0)   # (h, w)
+            m_flat  = m_avg.clamp(1e-8, 1 - 1e-8).flatten()
+            entropy = -(m_flat * m_flat.log()).sum()
+            tv_h = (M_t[i, :, :, 1:] - M_t[i, :, :, :-1]).abs().mean()
+            tv_w = (M_t[i, :, 1:, :] - M_t[i, :, :-1, :]).abs().mean()
+            tv   = tv_h + tv_w
+            loss     = loss + (self.alpha * entropy + self.beta * tv)
+            l_h_acc  += entropy.item()
+            l_tv_acc += tv.item()
+
+        loss = loss / B
+
+        # ── Inter-sample JS-divergence ─────────────────────────────────────────
+        N   = B * T
+        eye = torch.eye(N, dtype=torch.bool, device=M_t.device)
+        n_pairs = N * (N - 1)
+        eps = 1e-8
+        P = M_t.reshape(N, h * w) + eps
+        P = P / P.sum(dim=-1, keepdim=True)
+        log_P   = P.log()
+        P_i     = P.unsqueeze(1)
+        P_j     = P.unsqueeze(0)
+        M_mix   = 0.5 * (P_i + P_j)
+        log_M   = M_mix.log()
+        log_P_i = log_P.unsqueeze(1)
+        log_P_j = log_P.unsqueeze(0)
+        kl_im = (P_i * (log_P_i - log_M)).sum(dim=-1)
+        kl_jm = (P_j * (log_P_j - log_M)).sum(dim=-1)
+        js_matrix = 0.5 * (kl_im + kl_jm)
+        js_off = js_matrix.masked_fill(eye, 0.0)
+        mean_js = js_off.sum() / max(n_pairs, 1)
+        log2        = _math.log(2.0)
+        l_div_tensor = (log2 - mean_js).clamp_min(0.0)
+        loss = loss + self.diversity_weight * l_div_tensor
+
+        # Cosine similarity diagnostic
+        flat = M_t.reshape(N, h * w)
+        flat_n = flat / (flat.norm(dim=-1, keepdim=True) + 1e-8)
+        cos_matrix = flat_n @ flat_n.T
+        inter_sample_sim = float(
+            cos_matrix.masked_fill(eye, 0.0).sum().item() / (n_pairs + 1e-8)
+        )
+
+        return ExplanationLossOutput(
+            loss=loss,
+            l_h=l_h_acc / max(B, 1),
+            l_tv=l_tv_acc / max(B, 1),
+            l_div=float(l_div_tensor.item()),
+            inter_sample_sim=inter_sample_sim,
+        )
+
+
+# ── Hard Attention Diversity Loss (replaces PeakSpreadLoss) ──────────────────
+
+class HardAttentionDiversityLoss(nn.Module):
+    """UNITE-style attention diversity loss (CVPR 2025).
+
+    Directly penalises batch-level popularity concentration — the exact
+    quantity that peak_mode_share measures.
+
+    For each spatial cell, compute how much "probability mass" it receives
+    across all samples in the batch. Penalise when one cell monopolises
+    attention (Herfindahl concentration on batch popularity).
+
+    With B=2 and temperature=0.05 this approaches the hard argmax behaviour,
+    directly attacking the peak_mode_share metric.
+
+    peak_mode_share = fraction of batch samples sharing the argmax cell.
+    This loss = sum_c (popularity_c)^2 where popularity_c ∝ sum_b M_t[b,c].
+    Minimised when every sample peaks at a different cell (popularity uniform).
+    """
+    def __init__(self, temperature: float = 0.05):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, M_t: torch.Tensor) -> torch.Tensor:
+        """
+        M_t : (B, T, h, w) — softmax maps
+        Returns scalar. Higher = more concentrated = worse.
+        """
+        B, T, h, w = M_t.shape
+        # Time-average per sample → (B, h*w)
+        m_avg = M_t.mean(dim=1).reshape(B, h * w)
+
+        # Soft-argmax popularity: sharpen each sample's map then sum across batch
+        # temperature=0.05 → very close to hard argmax, directly mimics peak_mode_share
+        p_sharp = F.softmax(m_avg / self.temperature, dim=1)  # (B, h*w)
+
+        # Sum across batch: how popular is each cell? (h*w,)
+        popularity = p_sharp.sum(dim=0)  # (h*w,), sums to B
+
+        # Normalise so popularity sums to 1, then Herfindahl concentration
+        popularity = popularity / (popularity.sum() + 1e-8)
+
+        # Herfindahl: sum of squares. Uniform → 1/(h*w). One-cell → 1.0.
+        concentration = (popularity ** 2).sum() * (h * w)  # scaled: uniform→1
+
+        return concentration
+
+
+# ── Sharpness loss on raw logits (fixes mt_std ceiling) ──────────────────────
+
+def sharpness_loss(M_t_logits: torch.Tensor) -> torch.Tensor:
+    """Sharpness loss on pre-softmax logits — bounded to [-1, 0].
+
+    WHY LOGITS NOT SOFTMAX:
+      Softmax over 49 cells has a hard std ceiling of ≈0.141, below the 0.15
+      threshold. Raw logits have no ceiling so they can signal real sharpness.
+
+    WHY BOUNDED:
+      Raw logit std grows without limit as the conv learns (observed: 0.85 at
+      init, growing to 2000+ by E2 causing fp16 overflow → NaN). We use tanh
+      to squash std into [0,1] then negate, giving loss in [-1, 0].
+      - Uniform map  → std ≈ 0 → tanh(0) = 0   → loss = 0  (worst)
+      - Sharp map    → std → ∞ → tanh(∞) = 1   → loss = -1 (best)
+      This makes lambda_sharp=0.15 safe regardless of logit scale.
+
+    M_t_logits : (B, T, h, w) — raw scores from EarlyAttnHead before softmax.
+    """
+    B, T, h, w = M_t_logits.shape
+    flat = M_t_logits.reshape(B * T, h * w)
+    # centre per-map so std isn't affected by mean offset
+    flat = flat - flat.mean(dim=1, keepdim=True)
+    std_per_map = flat.std(dim=1)          # (B*T,), unbounded positive
+    # squash to [0,1] with tanh, scale so typical init std≈0.85 → tanh(0.85)≈0.69
+    sharpness = torch.tanh(std_per_map)    # (B*T,), in [0, 1)
+    return -sharpness.mean()               # in [-1, 0]; minimise → maximise sharpness
+
+
+# ── Phase 21 utilities ────────────────────────────────────────────────────────
+
+def _gaussian_blur_5d(x: torch.Tensor,
+                      kernel_size: int = 21,
+                      sigma: float = 10.0) -> torch.Tensor:
+    B, T, C, H, W = x.shape
+    x_flat = x.reshape(B * T, C, H, W)
+    blurred = TF.gaussian_blur(
+        x_flat,
+        kernel_size=[kernel_size, kernel_size],
+        sigma=[sigma, sigma],
+    )
+    return blurred.reshape(B, T, C, H, W)
+
+
+def build_bottlenecked_input(x: torch.Tensor,
+                              M_t: torch.Tensor,
+                              blur_kernel: int = 21,
+                              blur_sigma: float = 10.0,
+                              peak_floor: float = 0.0) -> torch.Tensor:
+    """Construct an M_t-gated input at image resolution.
+
+    x   : (B, T, 3, H, W)
+    M_t : (B, T, h, w) — softmax map (used here, not logits)
+
+    Gradient path: loss_faith → logits_B → model(x_b) → x_b → M_norm → M_t → EarlyAttnHead
+
+    Phase 22 — peak_floor fix:
+      Old behaviour (peak_floor=0.0): M_norm = M_up / M_up.max()
+        A diffuse softmax (peak≈0.10) divides by its own max → M_norm ≈ 0.5–1.0
+        across ~20 cells → bottleneck barely blurs → logits_B ≈ logits_A → KL ≈ 0.
+
+      New behaviour (peak_floor=0.25): denominator = max(M_up.max(), 0.25)
+        Same diffuse map (peak=0.10 < 0.25) → M_norm.max() ≈ 0.10/0.25 = 0.40
+        → most of the image is blurred (weight ≥ 0.60) → logits_B degrades
+        → KL > 0 → real gradient reaches EarlyAttnHead.
+        The model must concentrate mass above 0.25 to recover logits.
+    """
+    B, T, C, H, W = x.shape
+    M_up = F.interpolate(
+        M_t.reshape(B * T, 1, M_t.shape[-2], M_t.shape[-1]),
+        size=(H, W), mode="bilinear", align_corners=False,
+    ).reshape(B, T, 1, H, W)
+    M_peak = M_up.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+    if peak_floor and peak_floor > 0.0:
+        floor_t = torch.as_tensor(peak_floor, device=M_up.device, dtype=M_up.dtype)
+        M_peak = torch.maximum(M_peak, floor_t)
+    M_norm = (M_up / M_peak).clamp(0.0, 1.0)
+    with torch.no_grad():
+        x_blur = _gaussian_blur_5d(x.detach(), blur_kernel, blur_sigma)
+    x_b = M_norm * x + (1.0 - M_norm) * x_blur
+    return x_b
+
+
+def faithfulness_loss(logits_A: torch.Tensor,
+                       logits_B: torch.Tensor) -> torch.Tensor:
+    """One-way KL: sg(A) as target, B as prediction."""
+    pA = torch.sigmoid(logits_A.detach()).clamp(1e-6, 1.0 - 1e-6)
+    pB = torch.sigmoid(logits_B).clamp(1e-6, 1.0 - 1e-6)
+    kl = (pA * (pA.log() - pB.log())
+          + (1.0 - pA) * ((1.0 - pA).log() - (1.0 - pB).log()))
+    return kl.mean()
+
+
+def sparsity_loss(M_t: torch.Tensor) -> torch.Tensor:
+    """Negative mean peak-energy per (b, t) frame."""
+    return -M_t.amax(dim=(-2, -1)).mean()

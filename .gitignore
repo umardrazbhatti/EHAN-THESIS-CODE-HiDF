@@ -1,0 +1,31 @@
+# Python bytecode — never commit these
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Claude Code internal worktrees
+.claude/worktrees/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editor
+.vscode/settings.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training outputs (large, regenerated each run)
+/kaggle/working/
+outputs/
+*.zip
+
+# Face cache
+.face_cache/
