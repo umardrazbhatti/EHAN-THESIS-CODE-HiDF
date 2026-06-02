@@ -27,7 +27,7 @@ except ImportError:
     _MTCNN_AVAILABLE = False
 
 # Minimum free space (GB) required before writing a cache entry.
-CACHE_MIN_FREE_GB = 3.0
+CACHE_MIN_FREE_GB = 0.3
 
 # Print a summary warning every N skipped cache writes (not one per sample).
 CACHE_SKIP_REPORT_EVERY = 50
