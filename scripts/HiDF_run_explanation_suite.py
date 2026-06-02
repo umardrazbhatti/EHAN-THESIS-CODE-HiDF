@@ -32,9 +32,11 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     print("\n[ExplanationSuite] Collecting M_t across test set...")
 
     # ── 1. Collect all M_t + probs + gradient maps ─────────────────────────────
-    all_M_t_up  = []
-    all_probs   = []
-    all_frames  = []
+    all_M_t_up    = []
+    all_probs     = []
+    all_frames    = []
+    all_labels    = []
+    all_vid_paths = []
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Suite pass", leave=False):
@@ -43,10 +45,14 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
             all_M_t_up.append(out.M_t_up.cpu())
             all_probs.extend(out.prob.cpu().tolist())
             all_frames.append(frames.cpu())
+            all_labels.extend(batch.get("label", torch.zeros(frames.shape[0])).cpu().tolist())
+            all_vid_paths.extend(batch.get("video_path", [""] * frames.shape[0]))
 
     all_M_t_up = torch.cat(all_M_t_up, dim=0)   # (N, T, H, W)
     all_frames  = torch.cat(all_frames, dim=0)   # (N, T, C, H, W)
     N = len(all_M_t_up)
+    all_labels    = list(all_labels)
+    all_vid_paths = list(all_vid_paths)
 
     subset_size = min(getattr(config, "heatmap_samples", 20), N)
     rng         = np.random.default_rng(42)
@@ -87,26 +93,54 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
 
     # ── 4. Deletion / Insertion AUC ───────────────────────────────────────────
     print("[ExplanationSuite] Computing deletion/insertion AUC...")
-    del_ins = {"deletion_auc": 0.0, "insertion_auc": 0.0}
-    try:
-        # Phase 20.1: use 8 samples instead of 1 for statistically reliable
-        # deletion/insertion AUC. Baseline (Xception+GradCAM) used 40 frames;
-        # we use 8 videos × 16 frames = 128 effective frames. T4 memory budget
-        # allows N=8 comfortably (~4 GB peak); larger N risks OOM during the
-        # batched forward pass inside deletion_insertion_auc.
-        N_DEL_INS = min(8, N)
-        rng_di = np.random.default_rng(42)
-        di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
-        frames_sample = all_frames[di_indices]              # (N_DEL_INS, T, C, H, W)
-        sal_sample    = all_M_t_up[di_indices].numpy()      # (N_DEL_INS, T, H, W)
-        del_ins = ExplanationMetrics.deletion_insertion_auc(
-            model, frames_sample, sal_sample, steps=10
+    # Phase 23: increased from 8 to 100 samples for statistical reliability.
+    N_DEL_INS = min(100, N)
+    rng_di    = np.random.default_rng(42)
+    di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
+
+    per_sample_del_ins = []
+    _del_aucs = []
+    _ins_aucs = []
+
+    for _si, _di in enumerate(di_indices):
+        _f_s = all_frames[_di:_di+1]          # (1, T, C, H, W)
+        _s_s = all_M_t_up[_di:_di+1].numpy()  # (1, T, H, W) — confirmed M_t_up
+        _prob_s  = float(all_probs[_di])
+        _label_s = int(all_labels[_di]) if all_labels else -1
+        _vpath_s = str(all_vid_paths[_di]) if all_vid_paths else ""
+        _di_result = ExplanationMetrics.deletion_insertion_auc(
+            model, _f_s, _s_s, steps=10, n_samples=1
         )
-        print(f"  [del/ins AUC on N={N_DEL_INS} samples]  "
-              f"del={del_ins.get('deletion_auc', 0):.4f}  "
-              f"ins={del_ins.get('insertion_auc', 0):.4f}")
-    except Exception as e:
-        print(f"  [del/ins AUC skipped: {e}]")
+        _d_auc = float(_di_result.get("deletion_auc", 0.0))
+        _i_auc = float(_di_result.get("insertion_auc", 0.0))
+        _del_aucs.append(_d_auc)
+        _ins_aucs.append(_i_auc)
+        _mt_std_s   = float(all_M_t_up[_di].std().item())
+        _faith_s    = _i_auc - _d_auc
+        per_sample_del_ins.append({
+            "video_path":       _vpath_s,
+            "label":            _label_s,
+            "prob":             _prob_s,
+            "deletion_auc":     _d_auc,
+            "insertion_auc":    _i_auc,
+            "m_t_std":          _mt_std_s,
+            "faithfulness_score": _faith_s,
+        })
+        print(f"  [del/ins AUC sample {_si+1}/{N_DEL_INS}]  "
+              f"del={_d_auc:.4f}  ins={_i_auc:.4f}")
+
+    del_ins = {
+        "deletion_auc":  float(np.mean(_del_aucs)) if _del_aucs else 0.0,
+        "insertion_auc": float(np.mean(_ins_aucs)) if _ins_aucs else 0.0,
+    }
+    print(f"  [del/ins AUC aggregate N={N_DEL_INS}]  "
+          f"del={del_ins['deletion_auc']:.4f}  ins={del_ins['insertion_auc']:.4f}")
+
+    _per_sample_path = Path("outputs") / "explanation_per_sample.json"
+    _per_sample_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(_per_sample_path, "w") as _psf:
+        json.dump(per_sample_del_ins, _psf, indent=2)
+    print(f"  [per-sample results saved → {_per_sample_path}]")
 
     # ── 5. Collapse diagnostics ───────────────────────────────────────────────
     print("[ExplanationSuite] Computing collapse diagnostics...")

@@ -49,13 +49,20 @@ class ExplanationMetrics:
 
     @staticmethod
     def deletion_insertion_auc(model, frames, saliency,
-                               steps: int = 10) -> dict:
+                               steps: int = 10,
+                               n_samples: int = 100) -> dict:
         """
         Deletion/Insertion AUC: simplified implementation.
         Steps are coarse for speed; increase for publication-quality numbers.
+
+        n_samples: maximum number of video clips to process (default 100).
         """
+        print(f"[del_ins] Running on {n_samples} samples, steps={steps}")
         device = next(model.parameters()).device
-        B, T, C, H, W = frames.shape
+        B_full, T, C, H, W = frames.shape
+        B = min(n_samples, B_full)
+        frames   = frames[:B]
+        saliency = saliency[:B]
         total_pixels  = H * W
 
         import torch.nn.functional as _F

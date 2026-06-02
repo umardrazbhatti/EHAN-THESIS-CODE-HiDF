@@ -251,7 +251,7 @@ def main(config: EAHNConfig):
             "faith": 0.0, "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
-        LOG_EVERY = 200
+        LOG_EVERY = 1000
         run = {
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "cons": 0.0, "faith": 0.0, "sparse": 0.0,
@@ -382,7 +382,7 @@ def main(config: EAHNConfig):
                       f"(log_tau={model.early_attn.log_tau.item():.4f})")
 
             # ── Batch balance check ───────────────────────────────────────────
-            if (batch_idx + 1) % LOG_EVERY == 0:
+            if (batch_idx + 1) % 1000 == 0:
                 bl = batch["label"].detach().cpu().numpy().astype(int)
                 n_real, n_fake = int((bl == 0).sum()), int((bl == 1).sum())
                 print(f"[BatchBalance] step={batch_idx+1} real={n_real} fake={n_fake}")
@@ -411,7 +411,7 @@ def main(config: EAHNConfig):
             epoch_acc["n"]           += 1
 
             # ── Rolling log ───────────────────────────────────────────────────
-            if (batch_idx + 1) % LOG_EVERY == 0 or (batch_idx + 1) == total_batches:
+            if (batch_idx + 1) % 1000 == 0 or (batch_idx + 1) == total_batches:
                 n = max(run["n"], 1)
                 _tau = out_A.early_attn_tau  # v4: actual M_t sharpening tau
                 print(
