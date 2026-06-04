@@ -44,7 +44,7 @@ except ImportError:
     )
 
 from data.HiDF_face_align import FaceAligner
-from data.HiDF_transforms import get_transforms, get_heavy_transforms
+from data.HiDF_transforms import get_transforms, get_heavy_transforms, get_real_aug_transforms
 from data.HiDF_synthetic_generator import SyntheticDataGenerator
 
 # ---------------------------------------------------------------------------
@@ -503,14 +503,18 @@ class DeepfakeDataset(Dataset):
         video_id  = os.path.splitext(os.path.basename(sample["video_path"]))[0]
         frames_np = self.face_aligner.align_frames(frames_np, video_id)
 
-        # Heavy augmentation for minority-class samples when ratio > 3:1
+        # ── Per-class transform selection ─────────────────────────────────────
+        # Priority:
+        #   1. Heavy aug for minority-class samples under severe imbalance (ratio > 3:1)
+        #   2. Real-specific aug for all real training samples: RandomGrayscale + GaussianBlur
+        #      break per-video camera/compression identity shortcuts (see HiDF_transforms.py)
+        #   3. Standard train transform for all other training samples
+        #   4. Val/test transform (deterministic) outside training
         label = sample["label"]
-        if (
-            self.mode == "train"
-            and self.heavy_aug
-            and label == self.minority_class
-        ):
+        if self.mode == "train" and self.heavy_aug and label == self.minority_class:
             aug = get_heavy_transforms(self.config.frame_size)
+        elif self.mode == "train" and label == 0:
+            aug = get_real_aug_transforms(self.config.frame_size)
         else:
             aug = self.transform
 
