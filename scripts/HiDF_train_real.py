@@ -238,6 +238,19 @@ def main(config: EAHNConfig):
     )
     print(f"[sanity] clean (unaugmented) train loader built: {len(_clean_ds)} samples")
 
+    # ── Per-epoch overhead controls ───────────────────────────────────────────
+    _sanity_check_every = getattr(config, "sanity_check_every", 5)
+    _val_every          = getattr(config, "val_every", 1)
+    print(f"[Config] sanity_check_every={_sanity_check_every}  val_every={_val_every}  "
+          f"snapshot_every={config.snapshot_every}")
+
+    # Safe initial values so checkpoint / early-stop references work even when
+    # validation is skipped on the very first epoch (val_every > 1).
+    metrics          = {}
+    diag_cosine      = 0.0
+    diag_std         = 0.0
+    _peak_mode_share = 1.0
+
     # ── Training loop ─────────────────────────────────────────────────────────
     total_batches = len(train_loader)
     epoch_w       = len(str(start_epoch + config.epochs))
@@ -444,129 +457,132 @@ def main(config: EAHNConfig):
         history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
         history["train_sharp"].append(epoch_acc["sharp"] / n)
 
-        # ── Validation ────────────────────────────────────────────────────────
-        model.eval()
-        probs_list, labels_list = [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                frames = batch["frames"].to(device)
-                out    = model(frames)
-                probs_list.extend(out.prob.cpu().tolist())
-                labels_list.extend(batch["label"].cpu().tolist())
+        # ── Validation (runs every _val_every epochs; default 1 = every epoch) ──
+        if epoch % _val_every == 0:
+            model.eval()
+            probs_list, labels_list = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    frames = batch["frames"].to(device)
+                    out    = model(frames)
+                    probs_list.extend(out.prob.cpu().tolist())
+                    labels_list.extend(batch["label"].cpu().tolist())
 
-        metrics = DetectionMetrics.compute(probs_list, labels_list)
-        logger.log_scalars("val", metrics, epoch)
-        print(
-            f"Epoch {epoch:>{epoch_w}}/{start_epoch + config.epochs} | "
-            f"Val AUC-ROC: {metrics['auc_roc']:.4f} | "
-            f"F1: {metrics['f1_at_0.5']:.4f}"
-        )
-
-        _val_real_acc = float(metrics.get("real_accuracy",    0.0))
-        _val_fake_acc = float(metrics.get("fake_accuracy",    0.0))
-        _val_bal_acc  = float(metrics.get("balanced_accuracy", 0.0))
-        print(
-            f"[ValMetrics] epoch={epoch} "
-            f"real_acc={_val_real_acc:.3f} "
-            f"fake_acc={_val_fake_acc:.3f} "
-            f"balanced_acc={_val_bal_acc:.3f}"
-        )
-
-        # ── Attention-diversity diagnostic (v4: full val-set) ────────────────
-        # mt_std: computed on M_t_LOGITS (pre-softmax) to avoid the 0.141 ceiling.
-        # peak_mode_share: argmax on softmax M_t (correct — matches diagnostic def).
-        # cosine: on softmax M_t (correct — measures map similarity).
-        _all_mt_flat       = []   # softmax maps for cosine + peak_mode_share
-        _all_mt_logit_flat = []   # raw logits for mt_std
-        _all_mt_peaks      = []
-        with torch.no_grad():
-            for _diag_batch in val_loader:
-                _diag_frames = _diag_batch["frames"].to(device)
-                _diag_out    = model(_diag_frames)
-                _mt_b        = _diag_out.M_t.mean(dim=1)           # (B, h, w) softmax
-                _mt_flat_b   = _mt_b.reshape(_mt_b.size(0), -1)    # (B, hw)
-                _ml_b        = _diag_out.M_t_logits.mean(dim=1)    # (B, h, w) raw logits
-                _ml_flat_b   = _ml_b.reshape(_ml_b.size(0), -1)    # (B, hw)
-                _all_mt_flat.append(_mt_flat_b.cpu())
-                _all_mt_logit_flat.append(_ml_flat_b.cpu())
-                _all_mt_peaks.extend([int(m.argmax().item()) for m in _mt_flat_b])
-        _all_mt_flat_cat   = torch.cat(_all_mt_flat, dim=0)         # (N_val, hw)
-        _all_ml_flat_cat   = torch.cat(_all_mt_logit_flat, dim=0)   # (N_val, hw)
-
-        # cosine similarity (on softmax maps)
-        _mt_norm_all = torch.nn.functional.normalize(_all_mt_flat_cat, dim=1)
-        _chunk = 64
-        _cos_vals = []
-        for _ci in range(0, len(_mt_norm_all), _chunk):
-            _row = _mt_norm_all[_ci:_ci+_chunk]
-            _cos_block = _row @ _mt_norm_all.t()
-            for _ri, _gi in enumerate(range(_ci, min(_ci+_chunk, len(_mt_norm_all)))):
-                _cos_block[_ri, _gi] = 0.0
-            _cos_vals.append(_cos_block.sum(dim=1))
-        _N_val      = len(_mt_norm_all)
-        diag_cosine = float(torch.cat(_cos_vals).sum() / max(_N_val * (_N_val - 1), 1))
-
-        # mt_std on RAW LOGITS — no softmax ceiling
-        diag_std    = float(_all_ml_flat_cat.std(dim=1).mean())
-
-        # peak_mode_share (on softmax argmax — correct)
-        _peak_counts = {}
-        for _pk in _all_mt_peaks:
-            _peak_counts[_pk] = _peak_counts.get(_pk, 0) + 1
-        _peak_mode_share = max(_peak_counts.values()) / max(len(_all_mt_peaks), 1)
-        model.train()
-
-        _pass_cos  = diag_cosine     < 0.95
-        _pass_std  = diag_std        > 0.15
-        _pass_peak = _peak_mode_share < 0.30
-        print(
-            f"[Diag] epoch={epoch}  scale=1.00  "
-            f"inter_sample_cos={diag_cosine:.3f} {'PASS' if _pass_cos  else 'FAIL'}  "
-            f"mt_std={diag_std:.4f} {'PASS' if _pass_std  else 'FAIL'}  "
-            f"peak_mode_share={_peak_mode_share:.3f} {'PASS' if _pass_peak else 'FAIL'}"
-        )
-
-        # ── History ───────────────────────────────────────────────────────────
-        history["val_auc_roc"].append(float(metrics.get("auc_roc", float("nan"))))
-        history["val_balanced_acc"].append(_val_bal_acc)
-        history["val_real_acc"].append(_val_real_acc)
-        history["val_fake_acc"].append(_val_fake_acc)
-        history["val_inter_sample_cos"].append(diag_cosine)
-        history["val_mt_std"].append(diag_std)
-        history["val_peak_mode_share"].append(_peak_mode_share)
-
-        # ── Clean-train sanity check ───────────────────────────────────────────
-        model.eval()
-        _clean_probs, _clean_labels = [], []
-        with _torch.no_grad():
-            for _i, _b in enumerate(_clean_loader):
-                if _i * config.batch_size >= 200:
-                    break
-                _f = _b["frames"].to(device)
-                _o = model(_f)
-                _clean_probs.extend(_o.prob.cpu().tolist())
-                _clean_labels.extend(_b["label"].cpu().tolist())
-        _clean_probs  = np.array(_clean_probs)
-        _clean_labels = np.array(_clean_labels)
-        _clean_real_acc = float(((_clean_probs < 0.5) & (_clean_labels == 0)).sum() /
-                                max((_clean_labels == 0).sum(), 1))
-        _clean_fake_acc = float(((_clean_probs >= 0.5) & (_clean_labels == 1)).sum() /
-                                max((_clean_labels == 1).sum(), 1))
-        print(f"[sanity] epoch={epoch} train_clean: real_acc={_clean_real_acc:.3f} "
-              f"fake_acc={_clean_fake_acc:.3f}  "
-              f"(if real_acc is much lower than val real_acc, aug shortcut still live)")
-
-        if _clean_fake_acc < 0.20:
+            metrics = DetectionMetrics.compute(probs_list, labels_list)
+            logger.log_scalars("val", metrics, epoch)
             print(
-                f"[sanity] WARNING — AUGMENTATION SHORTCUT DETECTED: "
-                f"train_clean fake_acc={_clean_fake_acc:.3f} < 0.20."
+                f"Epoch {epoch:>{epoch_w}}/{start_epoch + config.epochs} | "
+                f"Val AUC-ROC: {metrics['auc_roc']:.4f} | "
+                f"F1: {metrics['f1_at_0.5']:.4f}"
             )
-            if epoch >= 2:
-                print(
-                    f"[sanity] STOP CONDITION: train_clean fake_acc still < 0.20 at epoch {epoch}. "
-                    f"Diagnose augmentation pipeline first."
-                )
 
+            _val_real_acc = float(metrics.get("real_accuracy",    0.0))
+            _val_fake_acc = float(metrics.get("fake_accuracy",    0.0))
+            _val_bal_acc  = float(metrics.get("balanced_accuracy", 0.0))
+            print(
+                f"[ValMetrics] epoch={epoch} "
+                f"real_acc={_val_real_acc:.3f} "
+                f"fake_acc={_val_fake_acc:.3f} "
+                f"balanced_acc={_val_bal_acc:.3f}"
+            )
+
+            # ── Attention-diversity diagnostic (v4: full val-set) ─────────────
+            # mt_std: computed on M_t_LOGITS (pre-softmax) to avoid the 0.141 ceiling.
+            # peak_mode_share: argmax on softmax M_t (correct — matches diagnostic def).
+            # cosine: on softmax M_t (correct — measures map similarity).
+            _all_mt_flat       = []   # softmax maps for cosine + peak_mode_share
+            _all_mt_logit_flat = []   # raw logits for mt_std
+            _all_mt_peaks      = []
+            with torch.no_grad():
+                for _diag_batch in val_loader:
+                    _diag_frames = _diag_batch["frames"].to(device)
+                    _diag_out    = model(_diag_frames)
+                    _mt_b        = _diag_out.M_t.mean(dim=1)           # (B, h, w) softmax
+                    _mt_flat_b   = _mt_b.reshape(_mt_b.size(0), -1)    # (B, hw)
+                    _ml_b        = _diag_out.M_t_logits.mean(dim=1)    # (B, h, w) raw logits
+                    _ml_flat_b   = _ml_b.reshape(_ml_b.size(0), -1)    # (B, hw)
+                    _all_mt_flat.append(_mt_flat_b.cpu())
+                    _all_mt_logit_flat.append(_ml_flat_b.cpu())
+                    _all_mt_peaks.extend([int(m.argmax().item()) for m in _mt_flat_b])
+            _all_mt_flat_cat   = torch.cat(_all_mt_flat, dim=0)         # (N_val, hw)
+            _all_ml_flat_cat   = torch.cat(_all_mt_logit_flat, dim=0)   # (N_val, hw)
+
+            # cosine similarity (on softmax maps)
+            _mt_norm_all = torch.nn.functional.normalize(_all_mt_flat_cat, dim=1)
+            _chunk = 64
+            _cos_vals = []
+            for _ci in range(0, len(_mt_norm_all), _chunk):
+                _row = _mt_norm_all[_ci:_ci+_chunk]
+                _cos_block = _row @ _mt_norm_all.t()
+                for _ri, _gi in enumerate(range(_ci, min(_ci+_chunk, len(_mt_norm_all)))):
+                    _cos_block[_ri, _gi] = 0.0
+                _cos_vals.append(_cos_block.sum(dim=1))
+            _N_val      = len(_mt_norm_all)
+            diag_cosine = float(torch.cat(_cos_vals).sum() / max(_N_val * (_N_val - 1), 1))
+
+            # mt_std on RAW LOGITS — no softmax ceiling
+            diag_std    = float(_all_ml_flat_cat.std(dim=1).mean())
+
+            # peak_mode_share (on softmax argmax — correct)
+            _peak_counts = {}
+            for _pk in _all_mt_peaks:
+                _peak_counts[_pk] = _peak_counts.get(_pk, 0) + 1
+            _peak_mode_share = max(_peak_counts.values()) / max(len(_all_mt_peaks), 1)
+            model.train()
+
+            _pass_cos  = diag_cosine     < 0.95
+            _pass_std  = diag_std        > 0.15
+            _pass_peak = _peak_mode_share < 0.30
+            print(
+                f"[Diag] epoch={epoch}  scale=1.00  "
+                f"inter_sample_cos={diag_cosine:.3f} {'PASS' if _pass_cos  else 'FAIL'}  "
+                f"mt_std={diag_std:.4f} {'PASS' if _pass_std  else 'FAIL'}  "
+                f"peak_mode_share={_peak_mode_share:.3f} {'PASS' if _pass_peak else 'FAIL'}"
+            )
+
+            # ── History ───────────────────────────────────────────────────────
+            history["val_auc_roc"].append(float(metrics.get("auc_roc", float("nan"))))
+            history["val_balanced_acc"].append(_val_bal_acc)
+            history["val_real_acc"].append(_val_real_acc)
+            history["val_fake_acc"].append(_val_fake_acc)
+            history["val_inter_sample_cos"].append(diag_cosine)
+            history["val_mt_std"].append(diag_std)
+            history["val_peak_mode_share"].append(_peak_mode_share)
+
+        # ── Clean-train sanity check (epochs 1, 2, then every _sanity_check_every) ─
+        # Skipping saves ~1 full unaugmented forward pass per skipped epoch.
+        _run_sanity = (epoch <= 2) or (epoch % _sanity_check_every == 0)
+        if _run_sanity:
+            model.eval()
+            _clean_probs, _clean_labels = [], []
+            with _torch.no_grad():
+                for _i, _b in enumerate(_clean_loader):
+                    if _i * config.batch_size >= 200:
+                        break
+                    _f = _b["frames"].to(device)
+                    _o = model(_f)
+                    _clean_probs.extend(_o.prob.cpu().tolist())
+                    _clean_labels.extend(_b["label"].cpu().tolist())
+            _clean_probs  = np.array(_clean_probs)
+            _clean_labels = np.array(_clean_labels)
+            _clean_real_acc = float(((_clean_probs < 0.5) & (_clean_labels == 0)).sum() /
+                                    max((_clean_labels == 0).sum(), 1))
+            _clean_fake_acc = float(((_clean_probs >= 0.5) & (_clean_labels == 1)).sum() /
+                                    max((_clean_labels == 1).sum(), 1))
+            print(f"[sanity] epoch={epoch} train_clean: real_acc={_clean_real_acc:.3f} "
+                  f"fake_acc={_clean_fake_acc:.3f}  "
+                  f"(if real_acc is much lower than val real_acc, aug shortcut still live)")
+
+            if _clean_fake_acc < 0.20:
+                print(
+                    f"[sanity] WARNING — AUGMENTATION SHORTCUT DETECTED: "
+                    f"train_clean fake_acc={_clean_fake_acc:.3f} < 0.20."
+                )
+                if epoch >= 2:
+                    print(
+                        f"[sanity] STOP CONDITION: train_clean fake_acc still < 0.20 at epoch {epoch}. "
+                        f"Diagnose augmentation pipeline first."
+                    )
         model.train()
 
         # ── Checkpoint ────────────────────────────────────────────────────────
@@ -839,6 +855,27 @@ def main(config: EAHNConfig):
 
 
 if __name__ == "__main__":
+    import argparse as _ap_extra, sys as _sys_extra
+
+    # ── New per-run speed knobs — not in EAHNConfig, parsed before main config ──
+    _p_extra = _ap_extra.ArgumentParser(add_help=False)
+    _p_extra.add_argument(
+        "--sanity_check_every", type=int, default=5,
+        help="Run clean-train sanity check every N epochs "
+             "(always at epochs 1 and 2; default 5).")
+    _p_extra.add_argument(
+        "--val_every", type=int, default=1,
+        help="Run validation every N epochs (default 1 = every epoch).")
+    _ns_extra, _remaining = _p_extra.parse_known_args()
+
+    # Strip new args from sys.argv so parse_args() doesn't choke on unknowns
+    _sys_extra.argv = [_sys_extra.argv[0]] + _remaining
+
     args   = parse_args()
     config = EAHNConfig.from_args(args)
+
+    # Inject fields that are not part of EAHNConfig dataclass
+    config.sanity_check_every = _ns_extra.sanity_check_every
+    config.val_every           = _ns_extra.val_every
+
     main(config)
