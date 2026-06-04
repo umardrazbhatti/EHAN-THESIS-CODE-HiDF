@@ -131,28 +131,34 @@ class FaceAligner:
 
         # ── Disk-guarded cache write ───────────────────────────────────────────
         if self.cache_dir:
-            # Check free space on /kaggle/working (the actual disk),
-            # not on the cache dir itself (which may be tmpfs).
-            working_dir = "/kaggle/working"
-            if not os.path.exists(working_dir):
-                working_dir = os.path.dirname(self.cache_dir) or "/"
-            cache_ok = (
-                _has_disk_space(working_dir)
-                and _cache_size_gb(self.cache_dir) < MAX_CACHE_GB
-            )
-            if cache_ok:
-                os.makedirs(self.cache_dir, exist_ok=True)
-                try:
-                    np.save(cache_path, np.array(aligned, dtype=np.uint8))
-                except OSError:
+            # /kaggle/input is a read-only mount — never attempt to write.
+            # The pre-built cache was already consumed above (np.load); skip
+            # all write/size-guard logic to avoid false "cache skipped" spam
+            # and the wasted _cache_size_gb() scan on a ~10 GB read-only dir.
+            _is_readonly_mount = self.cache_dir.startswith("/kaggle/input")
+            if not _is_readonly_mount:
+                # Check free space on /kaggle/working (the actual disk),
+                # not on the cache dir itself (which may be tmpfs).
+                working_dir = "/kaggle/working"
+                if not os.path.exists(working_dir):
+                    working_dir = os.path.dirname(self.cache_dir) or "/"
+                cache_ok = (
+                    _has_disk_space(working_dir)
+                    and _cache_size_gb(self.cache_dir) < MAX_CACHE_GB
+                )
+                if cache_ok:
+                    os.makedirs(self.cache_dir, exist_ok=True)
+                    try:
+                        np.save(cache_path, np.array(aligned, dtype=np.uint8))
+                    except OSError:
+                        self._skip_count += 1
+                else:
                     self._skip_count += 1
-            else:
-                self._skip_count += 1
-                if self._skip_count % CACHE_SKIP_REPORT_EVERY == 1:
-                    cache_gb = _cache_size_gb(self.cache_dir)
-                    print(f"[FaceAligner] cache skipped "
-                          f"(disk<{CACHE_MIN_FREE_GB}GB or cache>{MAX_CACHE_GB}GB, "
-                          f"current={cache_gb:.1f}GB) — {self._skip_count} times")
+                    if self._skip_count % CACHE_SKIP_REPORT_EVERY == 1:
+                        cache_gb = _cache_size_gb(self.cache_dir)
+                        print(f"[FaceAligner] cache skipped "
+                              f"(disk<{CACHE_MIN_FREE_GB}GB or cache>{MAX_CACHE_GB}GB, "
+                              f"current={cache_gb:.1f}GB) — {self._skip_count} times")
 
         return aligned
 
