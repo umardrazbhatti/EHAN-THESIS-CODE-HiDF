@@ -144,7 +144,15 @@ class ExplanationMetrics:
             del_scores.append(del_score)
             ins_scores.append(ins_score)
 
-        _trapz = getattr(np, "trapezoid", np.trapz)
+        # NumPy 2.x removed np.trapz (renamed to np.trapezoid).
+        # getattr(np, "trapezoid", np.trapz) looks safe but Python evaluates
+        # ALL THREE arguments before calling getattr, so np.trapz raises
+        # AttributeError on NumPy 2.x even when "trapezoid" would have been found.
+        # try/except is the only safe way to handle this.
+        try:
+            _trapz = np.trapezoid   # NumPy ≥ 2.0
+        except AttributeError:
+            _trapz = np.trapz       # NumPy < 2.0
         del_auc = float(_trapz(del_scores) / steps)
         ins_auc = float(_trapz(ins_scores) / steps)
 
