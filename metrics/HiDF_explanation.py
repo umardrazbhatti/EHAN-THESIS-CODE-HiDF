@@ -56,6 +56,16 @@ class ExplanationMetrics:
         Steps are coarse for speed; increase for publication-quality numbers.
 
         n_samples: maximum number of video clips to process (default 100).
+
+        Returns
+        -------
+        dict with keys:
+          deletion_auc, insertion_auc  — AUC of confidence-vs-fraction curves
+          del_at_{0,10,25,50,100}pct   — deletion confidence at those removal levels
+          ins_at_{0,10,25,50,100}pct   — insertion confidence at those reveal levels
+          faithfulness_ok              — True when insertion_auc > deletion_auc
+        A faithful heatmap has insertion_auc > deletion_auc (high insertion = salient
+        regions restore confidence; low deletion = removing them destroys it).
         """
         print(f"[del_ins] Running on {n_samples} samples, steps={steps}")
         device = next(model.parameters()).device
@@ -79,22 +89,34 @@ class ExplanationMetrics:
             ax = torch.arange(k, dtype=torch.float32, device=x.device) - (k - 1) / 2
             g = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
             g = g / g.sum()
-            kx = g.view(1, 1, 1, k).expand(Cx, 1, 1, k)
-            ky = g.view(1, 1, k, 1).expand(Cx, 1, k, 1)
+            # FIX: .expand() returns a non-contiguous view; F.conv2d (grouped)
+            # requires contiguous weight tensors on some PyTorch versions.
+            kx = g.view(1, 1, 1, k).expand(Cx, 1, 1, k).contiguous()
+            ky = g.view(1, 1, k, 1).expand(Cx, 1, k, 1).contiguous()
             pad = k // 2
             blurred = _F.conv2d(flat, kx, padding=(0, pad), groups=Cx)
             blurred = _F.conv2d(blurred, ky, padding=(pad, 0), groups=Cx)
             return blurred.reshape(Bx, Tx, Cx, Hx, Wx)
 
         with torch.no_grad():
-            baseline_logit = model(frames.to(device)).prob.mean().item()
-            blurred_full = _gauss_blur(frames)            # (B, T, C, H, W)
+            baseline_conf = model(frames.to(device)).prob.mean().item()
+            blurred_full  = _gauss_blur(frames)            # (B, T, C, H, W)
+            blurred_conf  = model(blurred_full.to(device)).prob.mean().item()
 
         del_scores = []
         ins_scores = []
 
         # Use mean explanation over time
         sal = saliency.mean(1)   # (B, H, W)
+
+        # Checkpoint steps for per-percentage reporting (0%, 10%, 25%, 50%, 100%)
+        _pct_to_step = {
+            0:   0,
+            10:  max(0, round(0.10 * steps)),
+            25:  max(0, round(0.25 * steps)),
+            50:  max(0, round(0.50 * steps)),
+            100: steps,
+        }
 
         for step in range(steps + 1):
             frac = step / steps
@@ -125,7 +147,41 @@ class ExplanationMetrics:
         _trapz = getattr(np, "trapezoid", np.trapz)
         del_auc = float(_trapz(del_scores) / steps)
         ins_auc = float(_trapz(ins_scores) / steps)
-        return {"deletion_auc": del_auc, "insertion_auc": ins_auc}
+
+        # Assemble result dict — scalar values for CSV; per-checkpoint for reporting
+        result = {
+            "deletion_auc":    del_auc,
+            "insertion_auc":   ins_auc,
+            "faithfulness_ok": ins_auc > del_auc,
+        }
+        for pct, sidx in _pct_to_step.items():
+            if 0 <= sidx < len(del_scores):
+                result[f"del_at_{pct}pct"] = float(del_scores[sidx])
+                result[f"ins_at_{pct}pct"] = float(ins_scores[sidx])
+
+        # ── Print formatted curve table ──────────────────────────────────────
+        print(f"\n  [Del/Ins] baseline_conf={baseline_conf:.4f}  "
+              f"blurred_conf={blurred_conf:.4f}  n_clips={B}  steps={steps}")
+        print(f"  {'%removed':>8}  {'del_conf':>9}  {'ins_conf':>9}  "
+              f"{'del_drop':>10}  {'ins_gain':>10}")
+        for pct in [0, 10, 25, 50, 100]:
+            dk = f"del_at_{pct}pct"
+            ik = f"ins_at_{pct}pct"
+            if dk in result and ik in result:
+                drop = baseline_conf - result[dk]
+                gain = result[ik] - blurred_conf
+                print(f"  {pct:>7}%  {result[dk]:>9.4f}  {result[ik]:>9.4f}  "
+                      f"{drop:>+10.4f}  {gain:>+10.4f}")
+        faithful_tag = "✓ faithful" if ins_auc > del_auc else "✗ NOT faithful"
+        print(f"  AUC → deletion={del_auc:.4f}  insertion={ins_auc:.4f}  [{faithful_tag}]")
+        if ins_auc > del_auc:
+            print("  Removing salient regions drops confidence MORE than random — "
+                  "heatmap IS predictive.")
+        else:
+            print("  WARNING: insertion_auc <= deletion_auc — heatmap NOT more "
+                  "predictive than random. Check M_t gradient flow.")
+
+        return result
 
     @staticmethod
     def collapse_diagnostics(all_M_t: torch.Tensor) -> Dict[str, float]:

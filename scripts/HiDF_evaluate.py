@@ -526,19 +526,27 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         grad_7_avg.reshape(subset_size, -1),
     )
 
-    # Deletion / Insertion AUC on the first heatmap sample
+    # ── Deletion / Insertion AUC (up to 5 heatmap samples) ─────────────────────
+    # Uses 5 clips for statistical reliability vs. 1-clip original.
+    # Root cause of historic 0.0 values: _gauss_blur used .expand() (non-contiguous)
+    # which F.conv2d (grouped) rejects on some PyTorch versions → now fixed with
+    # .contiguous() in metrics/HiDF_explanation.py.
+    import traceback as _traceback
     del_ins = {"deletion_auc": 0.0, "insertion_auc": 0.0}
+    _n_del_ins = min(subset_size, 5)   # 5 clips: reliable AUC, GPU-friendly
     try:
-        sample_idx    = int(indices[0])
-        frames_sample = test_ds[sample_idx]["frames"].unsqueeze(0)
-        sal_sample    = all_M_t_up[sample_idx].unsqueeze(0)   # (1,T,H,W)
-        if isinstance(sal_sample, torch.Tensor):
-            sal_np = sal_sample.numpy()
+        _di_frames_list = [test_ds[int(indices[i])]["frames"]
+                           for i in range(_n_del_ins)]          # each (T,C,H,W)
+        _frames_stack   = torch.stack(_di_frames_list, dim=0)   # (N,T,C,H,W)
+        _sal_indices    = [int(indices[i]) for i in range(_n_del_ins)]
+        _sal_stack      = all_M_t_up[_sal_indices]              # (N,T,H,W) tensor
+        _sal_np         = _sal_stack.numpy()
         del_ins = ExplanationMetrics.deletion_insertion_auc(
-            model, frames_sample, sal_np, steps=10
+            model, _frames_stack, _sal_np, steps=10, n_samples=_n_del_ins
         )
     except Exception as e:
-        print(f"  [Deletion/Insertion AUC skipped: {e}]")
+        print(f"  [Deletion/Insertion AUC error: {e}]")
+        _traceback.print_exc()
 
     # ── Collapse diagnostics ──────────────────────────────────────────────────
     collapse_diag = ExplanationMetrics.collapse_diagnostics(all_M_t_up)
@@ -571,11 +579,51 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     # explanation_metrics.json["intrinsic"]["mt_vs_random_model_cosine"].
     # Do NOT add it back here as a placeholder; read from that JSON if needed.
 
+    # ── Frame attention drop test (k=1, 2, 4 frames zeroed out) ──────────────
+    # Faithfulness test: dropping the top-K attended frames should reduce model
+    # confidence more than dropping K random frames. ratio > 1.5 = faithful.
+    print("\n[FrameDropTest] Computing k1/k2/k4 attention-drop faithfulness test...")
+    frame_drop_results = {}
+    try:
+        frame_drop_results = ExplanationMetrics.frame_attention_drop_test(
+            model, test_loader, device, k_values=(1, 2, 4), seed=42
+        )
+        print("[FrameDropTest] Results (top-K vs random-K drop):")
+        for _k in (1, 2, 4):
+            _td = frame_drop_results.get(f"k{_k}_top_conf_drop",    0.0)
+            _rd = frame_drop_results.get(f"k{_k}_random_conf_drop", 0.0)
+            _rt = frame_drop_results.get(f"k{_k}_ratio",            0.0)
+            _tag = "✓" if _rt > 1.5 else ("~" if _rt > 1.0 else "✗")
+            print(f"  k={_k}: top_drop={_td:+.4f}  random_drop={_rd:+.4f}  "
+                  f"ratio={_rt:.2f}x  {_tag}")
+        _k1_ratio = frame_drop_results.get("k1_ratio", 0.0)
+        if _k1_ratio > 1.5:
+            print("  [FrameDropTest] ✓ Attention maps target discriminative frames.")
+        elif _k1_ratio > 1.0:
+            print("  [FrameDropTest] ~ Attention maps marginally better than random.")
+        else:
+            print("  [FrameDropTest] ✗ Attention maps NOT more discriminative than random.")
+    except Exception as _fdt_err:
+        print(f"  [FrameDropTest skipped: {_fdt_err}]")
+        import traceback as _fdt_tb; _fdt_tb.print_exc()
+
+    # ── Assemble explanation metrics for CSV ──────────────────────────────────
+    # Only scalar floats go to metrics.csv.  Per-step del/ins values give thesis
+    # readers the confidence curve without needing to re-run evaluation.
+    _del_ins_scalars = {
+        "deletion_auc":  del_ins.get("deletion_auc",  0.0),
+        "insertion_auc": del_ins.get("insertion_auc", 0.0),
+        "del_at_10pct":  del_ins.get("del_at_10pct",  0.0),
+        "del_at_50pct":  del_ins.get("del_at_50pct",  0.0),
+        "ins_at_10pct":  del_ins.get("ins_at_10pct",  0.0),
+        "ins_at_50pct":  del_ins.get("ins_at_50pct",  0.0),
+    }
     exp_metrics = {
-        "temporal_ssim":              ssim_val,
-        "faithfulness_corr":          faithful_corr,
-        **del_ins,
+        "temporal_ssim":     ssim_val,
+        "faithfulness_corr": faithful_corr,
+        **_del_ins_scalars,
         **collapse_diag,
+        **frame_drop_results,   # k1/k2/k4_top_conf_drop, _random_conf_drop, _ratio
     }
     print("Explanation Metrics:", exp_metrics)
 
@@ -641,7 +689,14 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         "h_mean": h_mean,
         "temporal_ssim": float(ssim_val),
         "insertion_auc": ins_auc,
-        "deletion_auc": del_auc,
+        "deletion_auc":  del_auc,
+        # Per-step del/ins confidence curve
+        "del_at_10pct":  del_ins.get("del_at_10pct",  0.0),
+        "del_at_50pct":  del_ins.get("del_at_50pct",  0.0),
+        "ins_at_10pct":  del_ins.get("ins_at_10pct",  0.0),
+        "ins_at_50pct":  del_ins.get("ins_at_50pct",  0.0),
+        # Frame attention drop test
+        **{k: v for k, v in frame_drop_results.items()},
     }
     metrics_json["active_manipulation"] = getattr(config, "active_manipulation", "")
     # Task 1.5: primary filename is ffpp_test_metrics.json; keep metrics.json as
@@ -655,7 +710,29 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     print(f"[Evaluate] ffpp_test_metrics.json saved → {json_path}")
     print(f"[Evaluate] metrics.json (compat copy) → {json_compat_path}")
 
-    faithful_str = "yes" if ins_auc > del_auc else "NO — heatmap not predictive"
+    faithful_str = "YES — heatmap IS predictive" if ins_auc > del_auc else "NO — heatmap not predictive"
+    # Per-step del/ins curve lines for report
+    _del10  = del_ins.get("del_at_10pct",  "—")
+    _del50  = del_ins.get("del_at_50pct",  "—")
+    _ins10  = del_ins.get("ins_at_10pct",  "—")
+    _ins50  = del_ins.get("ins_at_50pct",  "—")
+    _d10s   = f"{_del10:.4f}" if isinstance(_del10, float) else _del10
+    _d50s   = f"{_del50:.4f}" if isinstance(_del50, float) else _del50
+    _i10s   = f"{_ins10:.4f}" if isinstance(_ins10, float) else _ins10
+    _i50s   = f"{_ins50:.4f}" if isinstance(_ins50, float) else _ins50
+    # Frame drop lines
+    _fdr_lines = ""
+    for _k in (1, 2, 4):
+        _td  = frame_drop_results.get(f"k{_k}_top_conf_drop",    None)
+        _rd  = frame_drop_results.get(f"k{_k}_random_conf_drop", None)
+        _rt  = frame_drop_results.get(f"k{_k}_ratio",            None)
+        if _td is not None:
+            _tag = "✓" if (_rt or 0) > 1.5 else ("~" if (_rt or 0) > 1.0 else "✗")
+            _fdr_lines += (f"  k={_k}: top_drop={_td:+.4f}  rand_drop={_rd:+.4f}  "
+                           f"ratio={_rt:.2f}x  {_tag}\n")
+    if not _fdr_lines:
+        _fdr_lines = "  (not computed)\n"
+
     report = (
         "EAHN Detection Report\n"
         "---------------------\n"
@@ -673,9 +750,17 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         f"Explanation quality:\n"
         f"  Mean heatmap entropy : {h_mean:.3f}    (lower = more focused)\n"
         f"  Temporal SSIM        : {ssim_val:.3f}      (1.0 = frozen across time)\n"
-        f"  Insertion AUC        : {ins_auc:.3f}\n"
-        f"  Deletion AUC         : {del_auc:.3f}\n"
+        f"  Faithfulness corr    : {faithful_corr:.3f}  (gradient vs. intrinsic)\n"
+        f"  Insertion AUC        : {ins_auc:.4f}  (higher = better)\n"
+        f"  Deletion AUC         : {del_auc:.4f}  (lower = better)\n"
         f"  Faithful? {faithful_str}\n"
+        f"\n"
+        f"Del/Ins confidence curve:\n"
+        f"  10% removed  → del_conf={_d10s}  ins_conf={_i10s}\n"
+        f"  50% removed  → del_conf={_d50s}  ins_conf={_i50s}\n"
+        f"\n"
+        f"Frame attention drop test (top-K vs random-K frames zeroed):\n"
+        f"{_fdr_lines}"
     )
     report_path = os.path.join(eval_dir, "report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
