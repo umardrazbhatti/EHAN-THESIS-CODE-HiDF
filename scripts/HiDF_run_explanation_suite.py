@@ -93,8 +93,9 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
 
     # ── 4. Deletion / Insertion AUC ───────────────────────────────────────────
     print("[ExplanationSuite] Computing deletion/insertion AUC...")
-    # Phase 23: increased from 8 to 100 samples for statistical reliability.
-    N_DEL_INS = min(100, N)
+    # Cap at 20 samples: each call runs the model on GPU (~10s each = ~3 min total).
+    # Was 100 — at that count the suite was hitting the 12-hour Kaggle limit.
+    N_DEL_INS = min(20, N)
     rng_di    = np.random.default_rng(42)
     di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
 
@@ -103,7 +104,7 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     _ins_aucs = []
 
     for _si, _di in enumerate(di_indices):
-        _f_s = all_frames[_di:_di+1]          # (1, T, C, H, W)
+        _f_s = all_frames[_di:_di+1].to(device)  # (1, T, C, H, W) — must be on GPU
         _s_s = all_M_t_up[_di:_di+1].numpy()  # (1, T, H, W) — confirmed M_t_up
         _prob_s  = float(all_probs[_di])
         _label_s = int(all_labels[_di]) if all_labels else -1
