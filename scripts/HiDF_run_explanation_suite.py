@@ -54,7 +54,7 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     all_labels    = list(all_labels)
     all_vid_paths = list(all_vid_paths)
 
-    subset_size = min(getattr(config, "heatmap_samples", 20), N)
+    subset_size = min(getattr(config, "heatmap_samples", 10), N)
     rng         = np.random.default_rng(42)
     indices     = rng.choice(N, subset_size, replace=False)
 
@@ -93,9 +93,9 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
 
     # ── 4. Deletion / Insertion AUC ───────────────────────────────────────────
     print("[ExplanationSuite] Computing deletion/insertion AUC...")
-    # Cap at 20 samples: each call runs the model on GPU (~10s each = ~3 min total).
-    # Was 100 — at that count the suite was hitting the 12-hour Kaggle limit.
-    N_DEL_INS = min(20, N)
+    # Cap at 10 samples: each call runs the model on GPU (~10s each = ~2 min total).
+    # Was 100 → reduced to 20 → now 10 to prevent OOM during explanation suite.
+    N_DEL_INS = min(10, N)
     rng_di    = np.random.default_rng(42)
     di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
 
@@ -129,6 +129,8 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
         })
         print(f"  [del/ins AUC sample {_si+1}/{N_DEL_INS}]  "
               f"del={_d_auc:.4f}  ins={_i_auc:.4f}")
+        del _f_s                               # release GPU tensor reference
+        torch.cuda.empty_cache()               # flush fragmented VRAM — prevents OOM on T4
 
     del_ins = {
         "deletion_auc":  float(np.mean(_del_aucs)) if _del_aucs else 0.0,
