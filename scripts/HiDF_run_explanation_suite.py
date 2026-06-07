@@ -3,6 +3,12 @@ scripts/run_explanation_suite.py — Orchestrator for all explanation quality me
 
 Runs all intrinsic metrics + new frame_attention_drop_test + stability_check
 on the given model and test loader. Saves a unified JSON to output_path.
+
+MEMORY DESIGN (6-7-26 refactor):
+  - GPU-first: keep all_M_t_up + sampled all_frames on GPU (T4 has 15 GB, ~6 GB used).
+  - No CPU-RAM accumulation of full-test-set frames (was ~5 GB, caused OOM at 414/415).
+  - Reuse pre-collected buffers from evaluate.py if passed in (avoid duplicate pass).
+  - Only allocate frames for the indices we actually use (subset ∪ di_indices).
 """
 
 import json
@@ -10,47 +16,64 @@ import torch
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+import gc
 
 from metrics.HiDF_explanation import ExplanationMetrics
 
 
-def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict:
+def run_explanation_suite(
+    model,
+    test_loader,
+    config,
+    output_path: Path,
+    all_M_t_up_gpu=None,
+    all_probs=None,
+    all_labels=None,
+    all_vid_paths=None,
+) -> dict:
     """
     Run all explanation metrics on the trained model + test loader.
     Save unified JSON to output_path. Print summary table.
     Returns the metrics dict.
 
     Args:
-        model       : trained EAHN model (eval mode will be set internally)
-        test_loader : DataLoader for test set (no shuffle)
-        config      : EAHNConfig
-        output_path : Path where explanation_metrics.json will be written
+        model              : trained EAHN model (eval mode set internally)
+        test_loader        : DataLoader for test set (shuffle=False so order is stable)
+        config             : EAHNConfig
+        output_path        : Path where explanation_metrics.json will be written
+        all_M_t_up_gpu     : optional pre-collected (N, T, H, W) GPU tensor from evaluate.py
+        all_probs          : optional list of N floats (probabilities)
+        all_labels         : optional list of N ints (labels)
+        all_vid_paths      : optional list of N strs (video paths)
+
+    If the optional buffers are provided, the suite skips its own collection pass
+    (saves ~3 min and ~1.3 GB of duplicated M_t).
     """
     device = torch.device(config.device)
     model.eval()
 
-    print("\n[ExplanationSuite] Collecting M_t across test set...")
+    # ── 1. Collect M_t (skip if pre-supplied) ──────────────────────────────────
+    if all_M_t_up_gpu is None:
+        print("\n[ExplanationSuite] Collecting M_t across test set (GPU-resident)...")
+        _M_chunks    = []
+        all_probs    = []
+        all_labels   = []
+        all_vid_paths = []
+        with torch.no_grad():
+            for batch in tqdm(test_loader, desc="Suite pass", leave=False):
+                frames = batch["frames"].to(device, non_blocking=True)
+                out    = model(frames)
+                _M_chunks.append(out.M_t_up.detach())             # keep on GPU
+                all_probs.extend(out.prob.detach().cpu().tolist())
+                all_labels.extend(batch.get("label", torch.zeros(frames.shape[0])).cpu().tolist())
+                all_vid_paths.extend(batch.get("video_path", [""] * frames.shape[0]))
+                del frames, out
+        all_M_t_up_gpu = torch.cat(_M_chunks, dim=0)               # (N, T, H, W) on GPU
+        del _M_chunks
+    else:
+        print("\n[ExplanationSuite] Reusing pre-collected M_t (skipping Pass 1).")
 
-    # ── 1. Collect all M_t + probs + gradient maps ─────────────────────────────
-    all_M_t_up    = []
-    all_probs     = []
-    all_frames    = []
-    all_labels    = []
-    all_vid_paths = []
-
-    with torch.no_grad():
-        for batch in tqdm(test_loader, desc="Suite pass", leave=False):
-            frames = batch["frames"].to(device)
-            out    = model(frames)
-            all_M_t_up.append(out.M_t_up.cpu())
-            all_probs.extend(out.prob.cpu().tolist())
-            all_frames.append(frames.cpu())
-            all_labels.extend(batch.get("label", torch.zeros(frames.shape[0])).cpu().tolist())
-            all_vid_paths.extend(batch.get("video_path", [""] * frames.shape[0]))
-
-    all_M_t_up = torch.cat(all_M_t_up, dim=0)   # (N, T, H, W)
-    all_frames  = torch.cat(all_frames, dim=0)   # (N, T, C, H, W)
-    N = len(all_M_t_up)
+    N = len(all_M_t_up_gpu)
     all_labels    = list(all_labels)
     all_vid_paths = list(all_vid_paths)
 
@@ -58,54 +81,87 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     rng         = np.random.default_rng(42)
     indices     = rng.choice(N, subset_size, replace=False)
 
-    # ── 2. Temporal SSIM ───────────────────────────────────────────────────────
-    print("[ExplanationSuite] Computing temporal SSIM...")
-    ssim_val = ExplanationMetrics.temporal_ssim(all_M_t_up[indices])
+    # ── Pre-sample del/ins indices ─────────────────────────────────────────────
+    N_DEL_INS = min(10, N)
+    rng_di    = np.random.default_rng(42)
+    di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
 
-    # ── 3. Gradient maps for faithfulness correlation ─────────────────────────
+    # Combined set of indices for which we actually need raw frames
+    needed_idx_set = set(int(i) for i in indices) | set(int(i) for i in di_indices)
+    print(f"[ExplanationSuite] need frames for {len(needed_idx_set)} sampled indices "
+          f"(subset={subset_size}, del_ins={N_DEL_INS})")
+
+    # ── 2. Targeted frames pass (GPU): only collect frames at needed indices ──
+    # Test loader has shuffle=False so we walk it in order and map batch slots
+    # to global indices. We keep these frames on GPU.
+    print("[ExplanationSuite] Collecting frames at sampled indices (GPU)...")
+    frames_by_idx = {}                                            # {int_idx: (1, T, C, H, W) GPU}
+    _bs = test_loader.batch_size or 1
+    _cursor = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            _frames_batch = batch["frames"]                       # (b, T, C, H, W)
+            _b = _frames_batch.shape[0]
+            # Determine which slots in this batch we need
+            _global = list(range(_cursor, _cursor + _b))
+            _local_keep = [(i, g) for i, g in enumerate(_global) if g in needed_idx_set]
+            if _local_keep:
+                _frames_gpu = _frames_batch.to(device, non_blocking=True)
+                for _i, _g in _local_keep:
+                    frames_by_idx[_g] = _frames_gpu[_i:_i+1].detach().clone()
+                del _frames_gpu
+            _cursor += _b
+            if len(frames_by_idx) >= len(needed_idx_set):
+                break
+    print(f"[ExplanationSuite] collected {len(frames_by_idx)} frame tensors on GPU "
+          f"(~{sum(f.numel()*4 for f in frames_by_idx.values())/1e6:.1f} MB)")
+
+    # ── 3. Temporal SSIM ───────────────────────────────────────────────────────
+    print("[ExplanationSuite] Computing temporal SSIM...")
+    ssim_val = ExplanationMetrics.temporal_ssim(all_M_t_up_gpu[indices])
+
+    # ── 4. Faithfulness correlation (gradient saliency) ───────────────────────
     print("[ExplanationSuite] Computing faithfulness correlation (gradient)...")
     grad_maps = []
     model.eval()
     for idx in tqdm(indices, desc="Grad maps", leave=False):
-        frames_t = all_frames[idx:idx+1].to(device).requires_grad_(True)
+        frames_t = frames_by_idx[int(idx)].clone().requires_grad_(True)
         out      = model(frames_t)
         out.logit.backward()
-        grads    = frames_t.grad.abs().mean(dim=2)        # (1, T, H, W)
+        grads    = frames_t.grad.abs().mean(dim=2)                # (1, T, H, W)
         grads_7  = torch.nn.functional.interpolate(
             grads.reshape(grads.shape[1], 1, *grads.shape[2:]),
             size=(7, 7), mode="bilinear", align_corners=False,
-        ).squeeze(1)                                       # (T, 7, 7)
-        grad_maps.append(grads_7.detach().cpu())
-        frames_t.requires_grad_(False)
+        ).squeeze(1)                                               # (T, 7, 7)
+        grad_maps.append(grads_7.detach())                        # keep GPU
+        del frames_t, out, grads, grads_7
     model.eval()
 
-    grad_maps  = torch.stack(grad_maps)                   # (subset, T, 7, 7)
-    M_sub      = all_M_t_up[indices].mean(dim=1)          # (subset, H, W)
+    grad_maps  = torch.stack(grad_maps)                            # (subset, T, 7, 7) GPU
+    M_sub      = all_M_t_up_gpu[indices].mean(dim=1)               # (subset, H, W) GPU
     M_sub_7    = torch.nn.functional.interpolate(
         M_sub.unsqueeze(1), size=(7, 7), mode="bilinear", align_corners=False,
-    ).squeeze(1)                                           # (subset, 7, 7)
-    grad_7_avg = grad_maps.mean(dim=1)                    # (subset, 7, 7)
+    ).squeeze(1)                                                    # (subset, 7, 7) GPU
+    grad_7_avg = grad_maps.mean(dim=1)                              # (subset, 7, 7) GPU
 
     faithful_corr = ExplanationMetrics.faithfulness_correlation(
         M_sub_7.reshape(subset_size, -1),
         grad_7_avg.reshape(subset_size, -1),
     )
+    del grad_maps, M_sub, M_sub_7, grad_7_avg
+    torch.cuda.empty_cache()
 
-    # ── 4. Deletion / Insertion AUC ───────────────────────────────────────────
+    # ── 5. Deletion / Insertion AUC (GPU-resident frames + saliency) ──────────
     print("[ExplanationSuite] Computing deletion/insertion AUC...")
-    # Cap at 10 samples: each call runs the model on GPU (~10s each = ~2 min total).
-    # Was 100 → reduced to 20 → now 10 to prevent OOM during explanation suite.
-    N_DEL_INS = min(10, N)
-    rng_di    = np.random.default_rng(42)
-    di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
-
+    # Cap at 10 samples: each call runs ~10 forward passes on GPU.
     per_sample_del_ins = []
     _del_aucs = []
     _ins_aucs = []
 
     for _si, _di in enumerate(di_indices):
-        _f_s = all_frames[_di:_di+1].to(device)  # (1, T, C, H, W) — must be on GPU
-        _s_s = all_M_t_up[_di:_di+1].numpy()  # (1, T, H, W) — confirmed M_t_up
+        _di = int(_di)
+        _f_s = frames_by_idx[_di]                                  # (1, T, C, H, W) GPU
+        _s_s = all_M_t_up_gpu[_di:_di+1].detach().cpu().numpy()    # numpy needed by metric impl
         _prob_s  = float(all_probs[_di])
         _label_s = int(all_labels[_di]) if all_labels else -1
         _vpath_s = str(all_vid_paths[_di]) if all_vid_paths else ""
@@ -116,7 +172,7 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
         _i_auc = float(_di_result.get("insertion_auc", 0.0))
         _del_aucs.append(_d_auc)
         _ins_aucs.append(_i_auc)
-        _mt_std_s   = float(all_M_t_up[_di].std().item())
+        _mt_std_s   = float(all_M_t_up_gpu[_di].std().item())
         _faith_s    = _i_auc - _d_auc
         per_sample_del_ins.append({
             "video_path":       _vpath_s,
@@ -129,8 +185,8 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
         })
         print(f"  [del/ins AUC sample {_si+1}/{N_DEL_INS}]  "
               f"del={_d_auc:.4f}  ins={_i_auc:.4f}")
-        del _f_s                               # release GPU tensor reference
-        torch.cuda.empty_cache()               # flush fragmented VRAM — prevents OOM on T4
+        # Per-sample VRAM hygiene — del/ins clones full (T,C,H,W) per step
+        torch.cuda.empty_cache()
 
     del_ins = {
         "deletion_auc":  float(np.mean(_del_aucs)) if _del_aucs else 0.0,
@@ -145,13 +201,11 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
         json.dump(per_sample_del_ins, _psf, indent=2)
     print(f"  [per-sample results saved → {_per_sample_path}]")
 
-    # ── 5. Collapse diagnostics ───────────────────────────────────────────────
+    # ── 6. Collapse diagnostics (GPU) ─────────────────────────────────────────
     print("[ExplanationSuite] Computing collapse diagnostics...")
-    collapse_diag = ExplanationMetrics.collapse_diagnostics(all_M_t_up)
+    collapse_diag = ExplanationMetrics.collapse_diagnostics(all_M_t_up_gpu)
 
-    # ── 6. Model randomization sanity check ───────────────────────────────────
-    # Task 1.7: fixed seed + n_random=30 for deterministic, statistically stable result.
-    # Compute ONCE here; evaluate.py reads this value from the returned dict.
+    # ── 7. Model randomization sanity check ───────────────────────────────────
     mt_vs_random_cosine = 1.0
     _RANDOM_TEST_N = int(getattr(config, "random_test_n_samples", 30))
     try:
@@ -160,8 +214,8 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
         _torch_sanity.manual_seed(42)
         _np_sanity.random.seed(42)
         from xai.HiDF_sanity_checks import model_randomization_check
-        # Use a fixed sample (index 0 of the subset) so both runs pick the same frame
-        _frames_s = all_frames[int(indices[0]):int(indices[0])+1].to(device)
+        _ref_idx = int(indices[0])
+        _frames_s = frames_by_idx[_ref_idx]                         # already on GPU
         mt_vs_random_cosine = model_randomization_check(
             model, _frames_s, n_random=_RANDOM_TEST_N
         )
@@ -170,7 +224,7 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     except Exception as e:
         print(f"  [model_randomization skipped: {e}]")
 
-    # ── 7. Frame attention drop test ──────────────────────────────────────────
+    # ── 8. Frame attention drop test ──────────────────────────────────────────
     print("[ExplanationSuite] Computing frame_attention_drop_test...")
     drop_results = {}
     try:
@@ -180,7 +234,7 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     except Exception as e:
         print(f"  [frame_attention_drop_test skipped: {e}]")
 
-    # ── 8. Stability check ────────────────────────────────────────────────────
+    # ── 9. Stability check ────────────────────────────────────────────────────
     print("[ExplanationSuite] Computing stability check...")
     stability = {}
     try:
@@ -231,5 +285,11 @@ def run_explanation_suite(model, test_loader, config, output_path: Path) -> dict
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"[ExplanationSuite] metrics saved → {output_path}")
+
+    # ── Final cleanup of suite-local buffers ──────────────────────────────────
+    del frames_by_idx
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return result

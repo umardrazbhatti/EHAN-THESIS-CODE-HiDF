@@ -3,10 +3,43 @@ data/transforms.py
 ==================
 Provides get_transforms(mode, frame_size) used by DeepfakeDataset.__getitem__.
 
-Train : random horizontal flip + colour jitter + Gaussian blur + ImageNet normalisation
-Val / Test : centre-crop resize + ImageNet normalisation only
+Train (6-7-26 cross-domain upgrade):
+    Standard resize + horizontal flip + STRONGER colour jitter + light Gaussian
+    blur + JPEG-compression simulation + small RandomErasing + ImageNet
+    normalisation.
+
+    Rationale (CelebDF generalization, fake_acc 0.03 → target ≥ 0.40):
+      HiDF and CelebDF use different cameras, codecs, lighting, and
+      synthesis pipelines.  Mild train-time augmentation (the previous 0.05
+      ColorJitter pipeline) lets the model memorise HiDF-specific compression
+      and colour fingerprints, so it sees CelebDF inputs as out-of-distribution
+      and predicts "real" for nearly every fake.
+
+      The expanded augmentation simulates cross-domain shifts WITHOUT erasing
+      manipulation artifacts:
+        - Stronger ColorJitter (0.15)            → camera / lighting variance
+        - GaussianBlur p=0.15, sigma≤1.2         → mild compression artefact
+        - RandomApply JPEG quality 40-80 p=0.30  → codec variance (CRITICAL —
+                                                   CelebDF is c23 H.264, HiDF
+                                                   uses a different codec)
+        - RandomHorizontalFlip p=0.5             → standard symmetry
+        - RandomErasing p=0.20 scale 0.02-0.06   → occlusion robustness;
+                                                   patches too small to wipe
+                                                   manipulation artifacts.
+      All augmentations are CLASS-SYMMETRIC (applied with same probability to
+      real and fake).  Per the existing project history, asymmetric heavy
+      augmentation creates "blur = real" / "noise = fake" shortcuts that
+      destroy the classifier; we deliberately avoid that.
+
+Val / Test:
+    Resize + ImageNet normalisation only — deterministic, matches inference.
 """
 
+import io
+import random
+
+import torch
+from PIL import Image
 from torchvision import transforms
 
 
@@ -15,58 +48,120 @@ _MEAN = [0.485, 0.456, 0.406]
 _STD  = [0.229, 0.224, 0.225]
 
 
-def get_heavy_transforms(frame_size: int = 224):
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom transforms (PIL-level) for codec-variance simulation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RandomJPEGCompression:
     """
-    Minority-class augmentation — kept identical to the standard training
-    pipeline (Fix 1) to prevent augmentation-artifact shortcut learning.
+    Re-encode the PIL image through JPEG at a random quality in [q_lo, q_hi].
+    Simulates the compression mismatch between HiDF (training) and CelebDF
+    (deployment).  Class-symmetric and applied with probability p.
+    """
+    def __init__(self, p: float = 0.30, q_lo: int = 40, q_hi: int = 80):
+        self.p    = float(p)
+        self.q_lo = int(q_lo)
+        self.q_hi = int(q_hi)
+
+    def __call__(self, img):
+        if random.random() > self.p:
+            return img
+        if not isinstance(img, Image.Image):
+            return img
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        q   = random.randint(self.q_lo, self.q_hi)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=q)
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(p={self.p}, "
+                f"q_lo={self.q_lo}, q_hi={self.q_hi})")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public transform builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_train_pipeline(frame_size: int = 224):
+    """
+    Cross-domain-robust train pipeline (6-7-26 upgrade).  Used by both classes.
     """
     return transforms.Compose([
         transforms.Resize((frame_size, frame_size)),
-        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
-            brightness=0.05,
-            contrast=0.05,
-            saturation=0.05,
-            hue=0.02,
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.15,
+            hue=0.03,
+        ),
+        RandomJPEGCompression(p=0.30, q_lo=40, q_hi=80),
+        transforms.RandomApply(
+            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))],
+            p=0.15,
         ),
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
+        transforms.RandomErasing(
+            p=0.20, scale=(0.02, 0.06), ratio=(0.3, 3.3), value=0.0,
+        ),
     ])
+
+
+def get_heavy_transforms(frame_size: int = 224):
+    """
+    Minority-class augmentation — uses the same cross-domain pipeline as the
+    standard training transform.  Kept identical (Fix 1) to prevent
+    augmentation-artifact shortcut learning where the model treats a
+    transformation as a class cue.
+    """
+    return _build_train_pipeline(frame_size)
 
 
 def get_real_aug_transforms(frame_size: int = 224):
     """
     Real-video training augmentation: standard pipeline plus low-probability
-    RandomGrayscale and GaussianBlur.
+    RandomGrayscale.
 
     Applied only to real (label=0) training samples to break per-video camera /
-    compression identity shortcuts. HiDF has ~3,500 real videos each with a
+    compression identity shortcuts.  HiDF has ~3,500 real videos each with a
     distinctive camera noise + colour calibration fingerprint; the model can
     memorise these early (real_acc → 1.0 by epoch 2) and coast on that signal
     rather than learning fake-specific artifacts, causing fake_acc to stagnate.
 
     Why real-only and not all samples:
-      Applying the same blur/grayscale to fakes would erase the facial boundary
-      artifacts that are the primary fake signal, counteracting the goal.
+      Applying grayscale to fakes would erase chroma-channel manipulation cues
+      that some methods leak.  Grayscale on reals is safe because reals have
+      no manipulation cues to begin with.
 
     Why low probability (p=0.1):
-      High-probability grayscale or blur applied consistently to reals would
-      itself become a class-conditional shortcut ("blurry = real"). At p=0.1
-      the augmentation is unpredictable and cannot be used as a cue.
+      High-probability grayscale applied consistently to reals would itself
+      become a class-conditional shortcut ("grayscale = real").  At p=0.1 the
+      augmentation is unpredictable and cannot be used as a cue.
     """
     return transforms.Compose([
         transforms.Resize((frame_size, frame_size)),
-        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
-            brightness=0.05,
-            contrast=0.05,
-            saturation=0.05,
-            hue=0.02,
+            brightness=0.15,
+            contrast=0.15,
+            saturation=0.15,
+            hue=0.03,
         ),
         transforms.RandomGrayscale(p=0.1),
-        transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.1),
+        RandomJPEGCompression(p=0.30, q_lo=40, q_hi=80),
+        transforms.RandomApply(
+            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))],
+            p=0.15,
+        ),
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
+        transforms.RandomErasing(
+            p=0.20, scale=(0.02, 0.06), ratio=(0.3, 3.3), value=0.0,
+        ),
     ])
 
 
@@ -88,24 +183,12 @@ def get_transforms(mode: str, frame_size: int = 224):
         of shape (3, frame_size, frame_size).
     """
     if mode == "train":
-        t = transforms.Compose([
-            transforms.Resize((frame_size, frame_size)),
-            transforms.RandomHorizontalFlip(p=0.3),
-            transforms.ColorJitter(
-                brightness=0.05,
-                contrast=0.05,
-                saturation=0.05,
-                hue=0.02,
-            ),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=_MEAN, std=_STD),
-        ])
+        t = _build_train_pipeline(frame_size)
         print(f"[get_transforms] train pipeline: {t}")
         return t
-    else:
-        # val and test: deterministic resize + normalise only
-        return transforms.Compose([
-            transforms.Resize((frame_size, frame_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=_MEAN, std=_STD),
-        ])
+    # val and test: deterministic resize + normalise only
+    return transforms.Compose([
+        transforms.Resize((frame_size, frame_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_MEAN, std=_STD),
+    ])

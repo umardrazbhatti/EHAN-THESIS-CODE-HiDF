@@ -126,31 +126,54 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Inference pass to get probs + M_t ─────────────────────────────────────
+    # ── Two-pass strategy (6-7-26 OOM fix) ───────────────────────────────────
+    # Pass 1: build probs/labels/meta + per-sample M_t (M_t kept on GPU, only
+    #         ~1.3 GB for 415 samples at 224×224 — fits in 15 GB T4).
+    # Pass 2: re-iterate loader picking out frames ONLY for sampled indices
+    #         (~10 videos = ~200 MB).  Avoids ~5 GB CPU RAM accumulation that
+    #         was killing the run at "Suite Pass 414/415".
     all_probs   = []
     all_labels  = []
-    all_M_t_up  = []
-    all_frames  = []
     all_meta    = []
+    _M_chunks   = []
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="XAI overlay inference", leave=False):
-            frames = batch["frames"].to(device)
+            frames = batch["frames"].to(device, non_blocking=True)
             out    = model(frames)
-            all_probs.extend(out.prob.cpu().tolist())
+            all_probs.extend(out.prob.detach().cpu().tolist())
             all_labels.extend(batch["label"].cpu().tolist())
-            all_M_t_up.append(out.M_t_up.cpu())
-            all_frames.append(batch["frames"].cpu())   # keep on CPU
+            _M_chunks.append(out.M_t_up.detach())             # GPU
             all_meta.extend(batch["meta"])
+            del frames, out
 
-    all_M_t_up = torch.cat(all_M_t_up, dim=0)   # (N, T, H, W)
-    all_frames  = torch.cat(all_frames, dim=0)   # (N, T, C, H, W)
+    all_M_t_up = torch.cat(_M_chunks, dim=0)                  # (N, T, H, W) GPU
+    del _M_chunks
 
     # ── Select 5 real + 5 fake ────────────────────────────────────────────────
     selected = _select_samples(all_probs, all_labels, n_high=2, n_mid=2, n_low=1)
     chosen_indices = selected.get("real", []) + selected.get("fake", [])
     print(f"[XAI overlays] Selected {len(chosen_indices)} videos: "
           f"real={len(selected.get('real',[]))} fake={len(selected.get('fake',[]))}")
+
+    # ── Pass 2: collect frames only for chosen indices ───────────────────────
+    chosen_set = set(int(i) for i in chosen_indices)
+    frames_by_idx = {}                                        # {int_idx: (T,C,H,W) CPU}
+    _cursor = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            _frames_batch = batch["frames"]                   # (b, T, C, H, W)
+            _b = _frames_batch.shape[0]
+            _global = list(range(_cursor, _cursor + _b))
+            _local_keep = [(i, g) for i, g in enumerate(_global) if g in chosen_set]
+            for _i, _g in _local_keep:
+                # Keep on CPU here — only used for _denormalize which needs CPU anyway
+                frames_by_idx[_g] = _frames_batch[_i].detach().clone()
+            _cursor += _b
+            if len(frames_by_idx) >= len(chosen_set):
+                break
+    print(f"[XAI overlays] collected {len(frames_by_idx)} frame tensors "
+          f"(~{sum(f.numel()*4 for f in frames_by_idx.values())/1e6:.1f} MB CPU)")
 
     # ── Load explainers ───────────────────────────────────────────────────────
     from xai.HiDF_gradcam import GradCAMExplainer
@@ -178,11 +201,15 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
             if video_path else f"sample{idx}"
         )
 
-        frames_t  = all_frames[idx:idx+1].to(device)   # (1, T, C, H, W)
-        orig_rgb  = _denormalize(all_frames[idx])       # list of T RGB arrays
+        if idx not in frames_by_idx:
+            print(f"  [XAI overlay] skip idx={idx} (no frames collected)")
+            continue
+        _frame_cpu = frames_by_idx[idx]                 # (T, C, H, W) CPU
+        frames_t   = _frame_cpu.unsqueeze(0).to(device) # (1, T, C, H, W) GPU
+        orig_rgb   = _denormalize(_frame_cpu)           # list of T RGB arrays
 
         # Intrinsic M_t
-        intrinsic = all_M_t_up[idx].numpy()   # (T, H, W)
+        intrinsic = all_M_t_up[idx].detach().cpu().numpy()   # (T, H, W)
 
         # Grad-CAM
         try:
@@ -225,5 +252,12 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
                           f"shape={overlay_bgr.shape}, dtype={overlay_bgr.dtype}")
 
         print(f"[XAI overlay] saved {video_id} ({label_str}, prob={prob:.2f})")
+
+    # Final cleanup
+    del frames_by_idx, all_M_t_up
+    import gc as _gc_xai
+    _gc_xai.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print(f"[XAI overlays] Done. Outputs in {output_dir}")

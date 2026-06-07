@@ -850,7 +850,36 @@ def main(config: EAHNConfig):
 
     if config.eval_after_train:
         from scripts.HiDF_evaluate import run_evaluation
-        print("\n--- Starting evaluation ---")
+        print("\n--- Pre-eval state cleanup ---")
+        # Release training-only state so its CPU RAM + GPU VRAM is available
+        # to the eval pipeline.  Without this, train_loader workers + optimizer
+        # state + history + plot figures co-resided with the eval datasets
+        # (HiDF + CelebDF + 5×FF++ + explanation suite) and OOM'd the process.
+        try:
+            del train_loader, val_loader
+        except Exception:
+            pass
+        try:
+            del optimizer, scheduler
+        except Exception:
+            pass
+        try:
+            del history
+        except Exception:
+            pass
+        try:
+            import matplotlib.pyplot as _plt_cleanup
+            _plt_cleanup.close("all")
+        except Exception:
+            pass
+        import gc as _gc_pre_eval
+        _gc_pre_eval.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            _cur = torch.cuda.memory_allocated(device) / 1e9
+            print(f"[Pre-Eval] GPU allocated after cleanup: {_cur:.2f} GB")
+        print("--- Starting evaluation ---")
         run_evaluation(config)
 
 

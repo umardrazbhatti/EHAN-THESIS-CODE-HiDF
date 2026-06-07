@@ -408,18 +408,25 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     print(f"[DataLoader test] batch_size={config.batch_size}  shuffle=False  size={len(test_ds)}")
 
     # ── Detection pass ────────────────────────────────────────────────────────
+    # GPU-resident M_t buffer (Phase 22 OOM fix): keep on GPU and reuse across
+    # collapse-diagnostics, explanation suite, overlays.  T4 has 15 GB; this
+    # tensor is ~1.3 GB at most for 415 × 16 × 224 × 224 float32.
     all_probs, all_labels = [], []
-    all_M_t_up = []
+    all_vid_paths        = []
+    _M_chunks            = []
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating detection"):
-            frames = batch["frames"].to(device)
+            frames = batch["frames"].to(device, non_blocking=True)
             out    = model(frames)
-            all_probs.extend(out.prob.cpu().tolist())
+            all_probs.extend(out.prob.detach().cpu().tolist())
             all_labels.extend(batch["label"].cpu().tolist())
-            all_M_t_up.append(out.M_t_up.cpu())
+            all_vid_paths.extend(batch.get("video_path", [""] * frames.shape[0]))
+            _M_chunks.append(out.M_t_up.detach())             # keep GPU
+            del frames, out
 
-    all_M_t_up = torch.cat(all_M_t_up, dim=0)   # (N_test, T, H, W)
+    all_M_t_up = torch.cat(_M_chunks, dim=0)                  # (N_test, T, H, W) GPU
+    del _M_chunks
 
     det_metrics = DetectionMetrics.compute(all_probs, all_labels)
     print("Detection Metrics:", det_metrics)
@@ -539,8 +546,8 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
                            for i in range(_n_del_ins)]          # each (T,C,H,W)
         _frames_stack   = torch.stack(_di_frames_list, dim=0)   # (N,T,C,H,W)
         _sal_indices    = [int(indices[i]) for i in range(_n_del_ins)]
-        _sal_stack      = all_M_t_up[_sal_indices]              # (N,T,H,W) tensor
-        _sal_np         = _sal_stack.numpy()
+        _sal_stack      = all_M_t_up[_sal_indices]              # (N,T,H,W) GPU tensor
+        _sal_np         = _sal_stack.detach().cpu().numpy()
         del_ins = ExplanationMetrics.deletion_insertion_auc(
             model, _frames_stack, _sal_np, steps=10, n_samples=_n_del_ins
         )
@@ -634,7 +641,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         return float(-(flat * np.log(flat)).sum())
 
     h_mean = float(np.mean([
-        _entropy(all_M_t_up[i].mean(0).numpy())
+        _entropy(all_M_t_up[i].mean(0).detach().cpu().numpy())
         for i in range(len(all_M_t_up))
     ]))
 
@@ -774,11 +781,11 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         _bd_manipulations = [parse_manipulation(s["video_path"]) for s in test_ds.samples]
 
         # Per-sample peak (row, col) from mean M_t
-        _M_mean = all_M_t_up.mean(dim=1)           # (N, H, W)
+        _M_mean = all_M_t_up.mean(dim=1)           # (N, H, W) GPU
         _bd_peak_rows: list[int] = []
         _bd_peak_cols: list[int] = []
         for _i in range(len(_M_mean)):
-            _m    = _M_mean[_i].numpy()
+            _m    = _M_mean[_i].detach().cpu().numpy()
             _pidx = np.unravel_index(_m.argmax(), _m.shape)
             _bd_peak_rows.append(int(_pidx[0]))
             _bd_peak_cols.append(int(_pidx[1]))
@@ -988,6 +995,19 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
               f"F1@opt = {_m.get('f1_at_optimal', 0):.4f}")
         print(f"[Celeb-DF cross-eval] metrics saved -> {_celebdf_json}")
 
+        # ── Stage cleanup: release CelebDF working memory before FF++ ─────────
+        try:
+            del _celeb_ds, _loader, _probs_list, _labels_list
+            del _face_aligner, _transform, _m
+            del _probs_np_cd, _labels_np_cd, _preds_cal
+        except Exception:
+            pass
+        import gc as _gc_cd
+        _gc_cd.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        print("[Stage Cleanup] CelebDF buffers released")
+
 
     # ────────────────────────────────────────────────────────────────────
     # FF++ per-manipulation cross-evaluation (Phase 19.1 — bug fix)
@@ -1090,20 +1110,55 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             print(f"[FF++ cross-eval] {_manip}: AUC-ROC = {_m.get('auc_roc', 0):.4f}  "
                   f"AUC-PR = {_m.get('auc_pr', 0):.4f}  F1@opt = {_m.get('f1_at_optimal', 0):.4f}")
 
+            # ── Per-iteration cleanup: release this manipulation's working set ──
+            try:
+                del _ffpp_ds, _loader, _probs_list, _labels_list, _tcfg, _m
+                del _probs_np_ff, _labels_np_ff, _preds_cal_ff
+            except Exception:
+                pass
+            import gc as _gc_ff
+            _gc_ff.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
         print("\n[FF++ cross-eval] done.")
+        print("[Stage Cleanup] FF++ cross-eval buffers released")
 
 
     # ── Explanation suite ────────────────────────────────────────────────────
     if getattr(config, "explanation_suite", True):
+        # Pre-suite full sweep: ensure CPU RAM is at minimum before allocating
+        # the suite's targeted frame buffer.  Reuses all_M_t_up_gpu from the
+        # detection pass so no duplicate forward pass is needed.
+        import gc as _gc_pre
+        _gc_pre.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            _free_gb = (torch.cuda.get_device_properties(0).total_memory
+                        - torch.cuda.memory_reserved()) / 1e9
+            print(f"[Pre-Suite] GPU free: ~{_free_gb:.2f} GB")
         try:
             from scripts.HiDF_run_explanation_suite import run_explanation_suite
             from scripts.HiDF_save_xai_overlays import save_xai_overlays
             _exp_out_path = _PPath(config.output_dir) / "explanation_metrics.json"
-            run_explanation_suite(model, test_loader, config, _exp_out_path)
+            run_explanation_suite(
+                model, test_loader, config, _exp_out_path,
+                all_M_t_up_gpu=all_M_t_up,
+                all_probs=all_probs,
+                all_labels=all_labels,
+                all_vid_paths=all_vid_paths,
+            )
+            # Inter-stage cleanup before overlays
+            import gc as _gc_post
+            _gc_post.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
             _overlay_dir = _PPath(config.output_dir) / "plots" / "heatmaps"
             save_xai_overlays(model, test_loader, config, _overlay_dir)
         except Exception as _suite_err:
             print(f"[ExplanationSuite] skipped: {_suite_err}")
+            import traceback as _suite_tb; _suite_tb.print_exc()
 
     # ── Heatmap generation ────────────────────────────────────────────────────
     if config.save_heatmaps:
