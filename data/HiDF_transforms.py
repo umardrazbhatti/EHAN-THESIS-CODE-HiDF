@@ -87,26 +87,42 @@ class RandomJPEGCompression:
 
 def _build_train_pipeline(frame_size: int = 224):
     """
-    Cross-domain-robust train pipeline (6-7-26 upgrade).  Used by both classes.
+    Cross-domain-robust train pipeline (6-8-26 v2 — moderated).
+
+    Background:
+      The 6-7-26 v1 pipeline (ColorJitter=0.15, GaussianBlur p=0.15,
+      RandomErasing p=0.20) moved CelebDF fake_acc from 0.03 → 0.37 — a real
+      win — but also crushed the spatial explanation signal in M_t (insertion
+      AUC 0.531 → 0.249, k1 ratio 7.38x → 1.00x). The architectural fix in
+      models/HiDF_eahn.py (temporal_gate bottleneck) now handles the frame
+      ranking structurally, so we don't need augmentation to be as aggressive.
+
+    v2 changes vs v1:
+      - ColorJitter 0.15 → 0.08      (still ~60% stronger than original 0.05)
+      - GaussianBlur p=0.15 → 0.10   (lighter — was destroying spatial peaks)
+      - RandomErasing p=0.20 → 0.10  (lighter — was eroding facial features)
+      - RandomJPEGCompression KEPT at p=0.30, q=40–80 (the main cross-domain
+        lever — codec mismatch HiDF vs CelebDF c23 H.264 — kept full strength
+        because JPEG compression is what bridges the actual domain gap)
     """
     return transforms.Compose([
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
-            brightness=0.15,
-            contrast=0.15,
-            saturation=0.15,
+            brightness=0.08,
+            contrast=0.08,
+            saturation=0.08,
             hue=0.03,
         ),
         RandomJPEGCompression(p=0.30, q_lo=40, q_hi=80),
         transforms.RandomApply(
-            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))],
-            p=0.15,
+            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))],
+            p=0.10,
         ),
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
         transforms.RandomErasing(
-            p=0.20, scale=(0.02, 0.06), ratio=(0.3, 3.3), value=0.0,
+            p=0.10, scale=(0.02, 0.05), ratio=(0.3, 3.3), value=0.0,
         ),
     ])
 
@@ -146,21 +162,21 @@ def get_real_aug_transforms(frame_size: int = 224):
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
-            brightness=0.15,
-            contrast=0.15,
-            saturation=0.15,
+            brightness=0.08,
+            contrast=0.08,
+            saturation=0.08,
             hue=0.03,
         ),
         transforms.RandomGrayscale(p=0.1),
         RandomJPEGCompression(p=0.30, q_lo=40, q_hi=80),
         transforms.RandomApply(
-            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.2))],
-            p=0.15,
+            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))],
+            p=0.10,
         ),
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
         transforms.RandomErasing(
-            p=0.20, scale=(0.02, 0.06), ratio=(0.3, 3.3), value=0.0,
+            p=0.10, scale=(0.02, 0.05), ratio=(0.3, 3.3), value=0.0,
         ),
     ])
 

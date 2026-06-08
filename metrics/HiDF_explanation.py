@@ -278,6 +278,12 @@ class ExplanationMetrics:
                 out     = model(frames)
                 orig_p  = out.prob.cpu()                      # (B,)
                 M_t     = out.M_t.cpu()                       # (B, T, h, w)
+                # Phase 23: use M_frame if present (proper per-frame attention
+                # produced by the temporal_gate bottleneck) — that is the
+                # quantity the classifier actually depends on.  Fall back to
+                # M_t.amax() ranking for older checkpoints without M_frame.
+                _has_M_frame = hasattr(out, "M_frame") and out.M_frame is not None
+                M_frame_cpu  = out.M_frame.cpu() if _has_M_frame else None
 
                 # Task 1.3 diagnostic: dump raw M_t statistics once (first batch only)
                 if not _debug_printed:
@@ -290,12 +296,18 @@ class ExplanationMetrics:
                           f"  {M_t.amin(dim=(-1,-2))}")
                     print(f"[DIAG frame_attn_drop] M_t std  per frame:\n"
                           f"  {M_t.std(dim=(-1,-2))}")
+                    if _has_M_frame:
+                        print(f"[DIAG frame_attn_drop] M_frame source: temporal_gate (Phase 23)")
+                        print(f"[DIAG frame_attn_drop] M_frame per sample:\n  {M_frame_cpu}")
+                    else:
+                        print(f"[DIAG frame_attn_drop] M_frame source: M_t.amax fallback")
                     _debug_printed = True
 
-                # Task 1.3 fix (cause c): use peak intensity (amax) for frame ranking
-                # rather than mean — peak reflects the heatmap focus point, while
-                # mean collapses to a near-constant when maps are spatially diffuse.
-                frame_scores = M_t.amax(dim=(-1, -2))         # (B, T) — peak per frame
+                if _has_M_frame:
+                    frame_scores = M_frame_cpu                # (B, T) — direct attention
+                else:
+                    # Legacy fallback: peak intensity per frame
+                    frame_scores = M_t.amax(dim=(-1, -2))     # (B, T)
 
                 for b in range(B):
                     scores_b  = frame_scores[b].numpy()              # (T,)

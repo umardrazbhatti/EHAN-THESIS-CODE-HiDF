@@ -40,6 +40,14 @@ class EAHNOutput:
     low_level:      torch.Tensor   # (B, T, C_low, Hl, Wl)
     attn_pool:      torch.Tensor   # (B, d_model)
     early_attn_tau: float          # exp(log_tau) at forward time — for logging
+    # ── Phase 23: temporal-attention bottleneck (frame-level M_t) ─────────────
+    # M_frame = softmax over T frames, computed AFTER the per-frame pool so the
+    # classifier MUST depend on which frames are weighted high. Replaces the
+    # uniform `.mean(dim=1)` that made all k1/k2/k4 frame-drop ratios ≈ 1.0x.
+    # Shape (B, T). Sums to 1 per sample. Read by metrics.HiDF_explanation
+    # .frame_attention_drop_test for ranking instead of M_t.amax.
+    M_frame:        torch.Tensor   # (B, T)
+    frame_attn_tau: float          # exp(frame_log_tau) — for logging
 
 
 class EarlyAttnHead(nn.Module):
@@ -121,6 +129,25 @@ class EAHN(nn.Module):
             attn_temp_init=getattr(config, "attn_temp_init", 0.0),
         )
 
+        # ── Temporal Attention Bottleneck (Phase 23) ──────────────────────────
+        # Replaces the uniform `attn_pool_per_frame.mean(dim=1)` with a learned
+        # per-frame weighting M_frame.  This is the critical fix for k1/k2/k4
+        # frame-drop ratios (which were stuck at 1.0x because the classifier
+        # consumed all frames democratically). With this gate, removing the
+        # top-attended frame substantially harms prediction → k1 ratio >> 1.
+        #
+        # Architecture (~17k params, +0.1% of model size):
+        #   LayerNorm(d) → Linear(d → d/4) → GELU → Linear(d/4 → 1) → softmax over T
+        # Learnable temperature `frame_log_tau` (init exp(-0.693)=0.5) controls
+        # how peaky M_frame can get; clamped to [0.1, 3.0] for stability.
+        self.temporal_gate = nn.Sequential(
+            nn.LayerNorm(d),
+            nn.Linear(d, max(d // 4, 32)),
+            nn.GELU(),
+            nn.Linear(max(d // 4, 32), 1),
+        )
+        self.frame_log_tau = nn.Parameter(torch.tensor(-0.693))   # tau ≈ 0.5 init
+
         # ── Classification Head ───────────────────────────────────────────────
         self.classifier = nn.Linear(d, 1)
         self._init_weights()
@@ -168,8 +195,17 @@ class EAHN(nn.Module):
         _legacy_M_t, _legacy_attn_pool = self.cross_attention(Q, spatial_tokens)
 
         M_flat = M_t_early.reshape(B, T, N)
-        attn_pool_per_frame = (Q * M_flat.unsqueeze(-1)).sum(dim=2)
-        attn_pool = attn_pool_per_frame.mean(dim=1)
+        attn_pool_per_frame = (Q * M_flat.unsqueeze(-1)).sum(dim=2)   # (B, T, d)
+
+        # ── Phase 23: temporal attention bottleneck (replaces .mean(dim=1)) ──
+        # Force the classifier to depend on which FRAMES carry attention mass,
+        # not just average all T frames democratically.  This is the structural
+        # fix for k1/k2/k4 ratios (previously ~1.0x because removing any frame
+        # only removed 1/T of an unweighted mean).
+        frame_logits = self.temporal_gate(attn_pool_per_frame).squeeze(-1)  # (B, T)
+        _tau_frame   = self.frame_log_tau.exp().clamp(min=0.1, max=3.0)
+        M_frame      = F.softmax(frame_logits / _tau_frame, dim=-1)         # (B, T)
+        attn_pool    = (attn_pool_per_frame * M_frame.unsqueeze(-1)).sum(dim=1)  # (B, d)
 
         M_t_up_early = F.interpolate(
             M_t_early.reshape(B * T, 1, self.feat_h, self.feat_w),
@@ -186,4 +222,6 @@ class EAHN(nn.Module):
             S=spatial_tokens, low_level=low_level,
             attn_pool=attn_pool,
             early_attn_tau=_tau_val,
+            M_frame=M_frame,
+            frame_attn_tau=float(_tau_frame.item()),
         )

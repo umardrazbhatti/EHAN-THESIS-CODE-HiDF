@@ -92,7 +92,7 @@ class EAHNConfig:
     lambda_faith:         float = 0.3     # weight for faithfulness KL loss
     lambda_sparse:        float = 0.05    # weight for sparsity (negative peak) loss
     faith_warmup_epochs:  int   = 3       # linear ramp from 0 → lambda_faith over N epochs
-    attn_floor:           float = 0.05    # gate floor in EarlyAttnHead
+    attn_floor:           float = 0.0     # Phase 23: gate floor reduced 0.05→0.0 to make M_t a true spatial bottleneck (was leaking 4.8% mass to every position regardless of M_t value)
     blur_kernel:          int   = 21      # Gaussian kernel size for bottlenecked input
     lambda_peak_spread:   float = 0.5     # v4: raised 0.3→0.5; weight for HardAttentionDiversityLoss
     lambda_sharp:         float = 0.15     # v4: raised 0.5→1.0; weight for sharpness loss on logits
