@@ -90,6 +90,7 @@ class EAHNConfig:
     # ── Phase 21: faithful attention bottleneck ───────────────────────────────
     phase21_enabled:      bool  = True    # master switch; False reverts to Phase 20 behaviour
     lambda_faith:         float = 0.3     # weight for faithfulness KL loss
+    lambda_ins:           float = 0.5     # Phase 24: weight for insertion-AUC training loss (focal BCE on bottlenecked logits) — re-uses existing out_B forward; default 0.5 makes faithfulness ~35% of gradient magnitude vs cls 73% (was ~0.5% with KL alone)
     lambda_sparse:        float = 0.05    # weight for sparsity (negative peak) loss
     faith_warmup_epochs:  int   = 3       # linear ramp from 0 → lambda_faith over N epochs
     attn_floor:           float = 0.0     # Phase 23: gate floor reduced 0.05→0.0 to make M_t a true spatial bottleneck (was leaking 4.8% mass to every position regardless of M_t value)
@@ -229,6 +230,10 @@ def parse_args() -> argparse.Namespace:
                         action="store_false")
     parser.add_argument("--lambda_faith", type=float, default=None,
                         help="Weight for Phase 21 faithfulness KL loss (default 0.3).")
+    parser.add_argument("--lambda_ins", type=float, default=None,
+                        help="Phase 24: weight for insertion-AUC training loss "
+                             "(focal BCE on bottlenecked logits — re-uses out_B). "
+                             "Default 0.5; shares faith_warmup_epochs ramp.")
     parser.add_argument("--lambda_sparse", type=float, default=None,
                         help="Weight for Phase 21 sparsity (negative peak) loss (default 0.05).")
     parser.add_argument("--faith_warmup_epochs", type=int, default=None,
