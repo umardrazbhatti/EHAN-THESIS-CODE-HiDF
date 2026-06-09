@@ -205,7 +205,8 @@ def build_bottlenecked_input(x: torch.Tensor,
                               M_t: torch.Tensor,
                               blur_kernel: int = 21,
                               blur_sigma: float = 10.0,
-                              peak_floor: float = 0.0) -> torch.Tensor:
+                              peak_floor: float = 0.0,
+                              hard_topk_frac: float = 0.0) -> torch.Tensor:
     """Construct an M_t-gated input at image resolution.
 
     x   : (B, T, 3, H, W)
@@ -223,17 +224,45 @@ def build_bottlenecked_input(x: torch.Tensor,
         → most of the image is blurred (weight ≥ 0.60) → logits_B degrades
         → KL > 0 → real gradient reaches EarlyAttnHead.
         The model must concentrate mass above 0.25 to recover logits.
+
+    Phase 25 — hard_topk_frac (insertion-AUC training):
+      When hard_topk_frac > 0 (typical: 0.20), build a binary top-K mask of the
+      most-attended (hard_topk_frac * H * W) pixels.  Forward uses the binary
+      mask; backward propagates as if mask = soft M_up (straight-through
+      estimator).  This makes loss_ins / loss_faith depend on a TRUE top-K
+      subset (the same subset the insertion metric uses at evaluation time),
+      so optimising those losses directly optimises the metric.
+
+      hard_topk_frac=0.0 (default) preserves Phase 22/24 behaviour.
     """
     B, T, C, H, W = x.shape
     M_up = F.interpolate(
         M_t.reshape(B * T, 1, M_t.shape[-2], M_t.shape[-1]),
         size=(H, W), mode="bilinear", align_corners=False,
     ).reshape(B, T, 1, H, W)
-    M_peak = M_up.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
-    if peak_floor and peak_floor > 0.0:
-        floor_t = torch.as_tensor(peak_floor, device=M_up.device, dtype=M_up.dtype)
-        M_peak = torch.maximum(M_peak, floor_t)
-    M_norm = (M_up / M_peak).clamp(0.0, 1.0)
+
+    if hard_topk_frac and hard_topk_frac > 0.0:
+        # Hard top-K binary mask with straight-through estimator.
+        # Forward: mask is exactly the top K pixels (matches insertion metric).
+        # Backward: gradient flows as if mask = M_up_soft (so M_t learns from
+        # which-pixels-helped-classification signal).
+        K = max(1, int(float(hard_topk_frac) * H * W))
+        flat       = M_up.reshape(B, T, H * W)
+        # threshold = K-th largest value per (b, t)
+        threshold  = flat.topk(K, dim=-1).values[..., -1:]                 # (B, T, 1)
+        M_hard     = (flat >= threshold).to(flat.dtype)                    # (B, T, H*W) binary
+        # Soft path for backward — normalise M_up to [0, 1] so it has the same scale
+        M_soft     = (flat / flat.amax(dim=-1, keepdim=True).clamp(min=1e-8)).clamp(0.0, 1.0)
+        # Straight-through: forward=M_hard, backward=M_soft
+        M_pass     = M_hard + (M_soft - M_soft.detach())
+        M_norm     = M_pass.reshape(B, T, 1, H, W)
+    else:
+        M_peak = M_up.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-8)
+        if peak_floor and peak_floor > 0.0:
+            floor_t = torch.as_tensor(peak_floor, device=M_up.device, dtype=M_up.dtype)
+            M_peak  = torch.maximum(M_peak, floor_t)
+        M_norm = (M_up / M_peak).clamp(0.0, 1.0)
+
     with torch.no_grad():
         x_blur = _gaussian_blur_5d(x.detach(), blur_kernel, blur_sigma)
     x_b = M_norm * x + (1.0 - M_norm) * x_blur
@@ -253,3 +282,21 @@ def faithfulness_loss(logits_A: torch.Tensor,
 def sparsity_loss(M_t: torch.Tensor) -> torch.Tensor:
     """Negative mean peak-energy per (b, t) frame."""
     return -M_t.amax(dim=(-2, -1)).mean()
+
+
+def temporal_sparsity_loss(M_frame: torch.Tensor) -> torch.Tensor:
+    """Phase 25: negative mean peak-weight per sample — pushes temporal_gate
+    toward peaky M_frame.
+
+    M_frame : (B, T)  softmax over time, sums to 1 per sample.
+    Uniform M_frame (1/T per cell) → loss = -1/T  (worst possible).
+    One-hot M_frame                → loss = -1    (best possible).
+
+    Why this matters: the k1/k2/k4 frame-drop test ranks frames by M_frame
+    score, then zeros the top-K vs zeros random-K and compares confidence
+    drops.  When M_frame is near-uniform (as in 6-9-26 0800hrs sample 2,
+    where values were 0.033–0.079 against uniform 0.0625), the ranking is
+    essentially random → top-K and random-K drops are equal → ratio ≈ 1.0
+    or below by noise.  This loss adds pressure for the gate to commit.
+    """
+    return -M_frame.amax(dim=-1).mean()

@@ -48,6 +48,11 @@ class EAHNOutput:
     # .frame_attention_drop_test for ranking instead of M_t.amax.
     M_frame:        torch.Tensor   # (B, T)
     frame_attn_tau: float          # exp(frame_log_tau) — for logging
+    # ── Phase 25: bi-directional refinement diagnostic ───────────────────────
+    # α = sigmoid(refine_gate); M_t = α * M_t_refined + (1-α) * M_t_early.
+    # 0.0 when bidirectional_enabled=False.  Logged in first-batch diagnostics
+    # so we can confirm the refinement gate is opening across epochs.
+    refine_alpha:   float = 0.0
 
 
 class EarlyAttnHead(nn.Module):
@@ -148,6 +153,20 @@ class EAHN(nn.Module):
         )
         self.frame_log_tau = nn.Parameter(torch.tensor(-0.693))   # tau ≈ 0.5 init
 
+        # ── Phase 25: Bi-directional refinement gate ──────────────────────────
+        # Pre-Phase-25 the CrossAttentionFusion module was wired into a discarded
+        # `_legacy_M_t` variable.  Phase 25 plugs its output back in as a
+        # *refined* M_t that has seen temporal context (Q comes from the
+        # transformer).  M_t_used = α * M_t_refined + (1-α) * M_t_early where
+        # α = sigmoid(refine_gate).  refine_gate is initialised at -2.0 so
+        # α ≈ 0.12 at epoch 0 — Phase 24 behaviour is preserved at start, and
+        # the model learns how much to trust the refined map as training
+        # progresses.  Set config.bidirectional_enabled=False to disable.
+        self.bidirectional_enabled = bool(
+            getattr(config, "bidirectional_enabled", True)
+        )
+        self.refine_gate = nn.Parameter(torch.tensor(-2.0))   # sigmoid(-2)≈0.119
+
         # ── Classification Head ───────────────────────────────────────────────
         self.classifier = nn.Linear(d, 1)
         self._init_weights()
@@ -192,9 +211,22 @@ class EAHN(nn.Module):
         Q, cls_out = self.temporal_stream(spatial_tokens.reshape(B, T * N, d))
         Q = Q.reshape(B, T, N, d)
 
-        _legacy_M_t, _legacy_attn_pool = self.cross_attention(Q, spatial_tokens)
+        # ── Phase 25: bi-directional refinement ──────────────────────────────
+        # Run CrossAttentionFusion with transformer-context Q vs spatial keys.
+        # Its M_t output (column-mean of attention) is now USED, not discarded.
+        # M_t_used = α * M_t_refined + (1-α) * M_t_early, α = sigmoid(refine_gate).
+        # α starts ≈ 0.12 so the first epoch matches Phase 24 behaviour; the
+        # model learns how much to trust the refinement as it converges.
+        if self.bidirectional_enabled:
+            M_t_refined, _xa_pool = self.cross_attention(Q, spatial_tokens)
+            alpha   = torch.sigmoid(self.refine_gate)
+            M_t_use = alpha * M_t_refined + (1.0 - alpha) * M_t_early
+            _alpha_val = float(alpha.item())
+        else:
+            M_t_use    = M_t_early
+            _alpha_val = 0.0
 
-        M_flat = M_t_early.reshape(B, T, N)
+        M_flat = M_t_use.reshape(B, T, N)
         attn_pool_per_frame = (Q * M_flat.unsqueeze(-1)).sum(dim=2)   # (B, T, d)
 
         # ── Phase 23: temporal attention bottleneck (replaces .mean(dim=1)) ──
@@ -207,8 +239,11 @@ class EAHN(nn.Module):
         M_frame      = F.softmax(frame_logits / _tau_frame, dim=-1)         # (B, T)
         attn_pool    = (attn_pool_per_frame * M_frame.unsqueeze(-1)).sum(dim=1)  # (B, d)
 
-        M_t_up_early = F.interpolate(
-            M_t_early.reshape(B * T, 1, self.feat_h, self.feat_w),
+        # Phase 25: M_t_up now reflects the REFINED map so the bottleneck
+        # construction (loss_ins/loss_faith) and downstream metric code both
+        # operate on the same M_t that the classifier consumes.
+        M_t_up_use = F.interpolate(
+            M_t_use.reshape(B * T, 1, self.feat_h, self.feat_w),
             size=(H, W), mode="bilinear", align_corners=False,
         ).reshape(B, T, H, W)
 
@@ -217,11 +252,12 @@ class EAHN(nn.Module):
 
         return EAHNOutput(
             logit=logit, prob=prob,
-            M_t=M_t_early, M_t_logits=M_t_logits,
-            M_t_up=M_t_up_early,
+            M_t=M_t_use, M_t_logits=M_t_logits,
+            M_t_up=M_t_up_use,
             S=spatial_tokens, low_level=low_level,
             attn_pool=attn_pool,
             early_attn_tau=_tau_val,
             M_frame=M_frame,
             frame_attn_tau=float(_tau_frame.item()),
+            refine_alpha=_alpha_val,
         )

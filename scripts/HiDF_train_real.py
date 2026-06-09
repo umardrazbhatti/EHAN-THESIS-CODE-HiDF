@@ -44,6 +44,7 @@ from losses.HiDF_explanation import (
     build_bottlenecked_input,
     faithfulness_loss,
     sparsity_loss,
+    temporal_sparsity_loss,       # Phase 25: pushes M_frame to be peaky → k1/k2/k4 > 1
 )
 from losses.HiDF_temporal import TemporalConsistencyLoss
 from metrics.HiDF_detection import DetectionMetrics
@@ -197,6 +198,7 @@ def main(config: EAHNConfig):
         "train_exp":           [], "train_temp":   [],
         "train_faith":         [], "train_sparse": [],
         "train_ins":           [],                      # Phase 24: insertion-AUC training loss
+        "train_temp_sparse":   [],                      # Phase 25: temporal-gate sparsity
         "train_peak_spread":   [],                      # v2: new term
         "train_sharp":         [],                      # v3: sharpness loss
         "val_auc_roc":         [], "val_balanced_acc":      [],
@@ -263,6 +265,7 @@ def main(config: EAHNConfig):
         epoch_acc = {
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "faith": 0.0, "ins": 0.0,                   # Phase 24
+            "temp_sparse": 0.0,                          # Phase 25
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
@@ -270,6 +273,7 @@ def main(config: EAHNConfig):
         run = {
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "cons": 0.0, "faith": 0.0, "ins": 0.0,      # Phase 24
+            "temp_sparse": 0.0,                          # Phase 25
             "sparse": 0.0, "peak_spread": 0.0,
             "sharp": 0.0, "n": 0,
         }
@@ -302,7 +306,10 @@ def main(config: EAHNConfig):
                         frames, M_t,
                         blur_kernel=config.blur_kernel,
                         blur_sigma=config.blur_sigma,
-                        peak_floor=config.bottleneck_peak_floor,  # Phase 22: fixed floor
+                        peak_floor=config.bottleneck_peak_floor,        # Phase 22: fixed floor
+                        hard_topk_frac=float(getattr(
+                            config, "bottleneck_hard_topk_frac", 0.0
+                        )),                                             # Phase 25: HARD top-K binary mask
                     )
                     out_B       = model(x_b)           # GRAD ENABLED (v2 fix)
                     loss_faith  = faithfulness_loss(logits_A, out_B.logit)
@@ -315,11 +322,22 @@ def main(config: EAHNConfig):
                     # select pixels whose preservation alone is sufficient for
                     # classification.  This is the insertion-AUC objective.
                     # ZERO additional forward passes (out_B already computed).
+                    # Phase 25: combined with hard_topk_frac=0.20 above, x_b
+                    # now keeps EXACTLY the top-K pixels and blurs the rest —
+                    # the same construction the insertion-AUC metric uses at
+                    # eval time, so this loss directly minimises the metric.
                     loss_ins    = cls_loss_fn(out_B.logit, labels)
+                    # ── Phase 25: temporal sparsity on M_frame ────────────────
+                    # Pushes the temporal_gate (Phase 23) toward a peaky
+                    # distribution. Without this, M_frame stayed near-uniform
+                    # (e.g. 6-9-26 0800hrs sample 2: values 0.033–0.079 vs
+                    # uniform 0.0625), which pinned k1/k2/k4 ratios below 1.0.
+                    loss_temp_sparse = temporal_sparsity_loss(out_A.M_frame)
                 else:
-                    loss_faith  = torch.zeros((), device=frames.device)
-                    loss_sparse = torch.zeros((), device=frames.device)
-                    loss_ins    = torch.zeros((), device=frames.device)
+                    loss_faith       = torch.zeros((), device=frames.device)
+                    loss_sparse      = torch.zeros((), device=frames.device)
+                    loss_ins         = torch.zeros((), device=frames.device)
+                    loss_temp_sparse = torch.zeros((), device=frames.device)
 
                 # ── Explanation + temporal ────────────────────────────────────
                 exp_out = exp_loss_fn(M_t)
@@ -352,11 +370,19 @@ def main(config: EAHNConfig):
                     epoch, config.faith_warmup_epochs,
                     float(getattr(config, "lambda_ins", 0.5)),
                 )
+                # Phase 25: temporal sparsity uses the same warmup curve.
+                # Without warmup it would dominate epoch 1 and collapse M_frame
+                # onto frame 0 before the classifier learns to discriminate.
+                lam_temp_sparse_eff = _faith_warmup(
+                    epoch, config.faith_warmup_epochs,
+                    float(getattr(config, "lambda_temp_sparse", 0.05)),
+                )
 
                 l_total = (loss_cls
                            + lam_faith_eff          * loss_faith
                            + lam_ins_eff            * loss_ins
                            + config.lambda_sparse    * loss_sparse
+                           + lam_temp_sparse_eff     * loss_temp_sparse  # Phase 25
                            + _lambda1_eff            * l_exp
                            + config.lambda2          * l_temp
                            + _lambda_peak_spread     * l_peak_spread
@@ -407,10 +433,12 @@ def main(config: EAHNConfig):
                       f"L_temp={l_temp.item():.6f}  L_faith={loss_faith.item():.6f}  "
                       f"L_ins={loss_ins.item():.6f}  "
                       f"L_sparse={loss_sparse.item():.6f}  "
+                      f"L_temp_sparse={loss_temp_sparse.item():.6f}  "       # Phase 25
                       f"L_peak_spread={l_peak_spread.item():.6f}  "
                       f"L_sharp={loss_sharp.item():.6f}")
                 print(f"[DIAG] lam_faith_eff={lam_faith_eff:.4f}  "
                       f"lam_ins_eff={lam_ins_eff:.4f}  "
+                      f"lam_temp_sparse_eff={lam_temp_sparse_eff:.4f}  "      # Phase 25
                       f"lambda_peak_spread={_lambda_peak_spread}  "
                       f"lambda_sharp={_lambda_sharp}  "
                       f"lambda_sparse={config.lambda_sparse}")
@@ -418,6 +446,14 @@ def main(config: EAHNConfig):
                 # NOT cross_attention.log_temp which is a dead legacy module
                 print(f"[DIAG] early_attn_tau={out_A.early_attn_tau:.4f}  "
                       f"(log_tau={model.early_attn.log_tau.item():.4f})")
+                # Phase 25: bi-directional refinement gate diagnostic
+                _alpha_print = float(getattr(out_A, "refine_alpha", 0.0))
+                _bidir_on    = bool(getattr(config, "bidirectional_enabled", True))
+                _hard_topk   = float(getattr(config, "bottleneck_hard_topk_frac", 0.0))
+                print(f"[DIAG-P25] bidirectional={_bidir_on}  refine_alpha={_alpha_print:.4f}  "
+                      f"refine_gate={model.refine_gate.item():.4f}  "
+                      f"hard_topk_frac={_hard_topk:.3f}  "
+                      f"frame_attn_tau={out_A.frame_attn_tau:.4f}")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -433,6 +469,7 @@ def main(config: EAHNConfig):
             _lco = l_consistency.item()
             _lf  = loss_faith.item()
             _li  = loss_ins.item()                        # Phase 24
+            _lts = loss_temp_sparse.item()                # Phase 25
             _ls  = loss_sparse.item()
             _lps = l_peak_spread.item()
             _lsh = loss_sharp.item()
@@ -441,12 +478,14 @@ def main(config: EAHNConfig):
             run["exp"]         += _le;  run["temp"]   += _lp
             run["cons"]        += _lco
             run["faith"]       += _lf;  run["ins"]    += _li     # Phase 24
+            run["temp_sparse"] += _lts                            # Phase 25
             run["sparse"]      += _ls
             run["peak_spread"] += _lps; run["sharp"]  += _lsh; run["n"] += 1
 
             epoch_acc["total"]       += _lt;  epoch_acc["cls"]    += _lc
             epoch_acc["exp"]         += _le;  epoch_acc["temp"]   += _lp
             epoch_acc["faith"]       += _lf;  epoch_acc["ins"]    += _li   # Phase 24
+            epoch_acc["temp_sparse"] += _lts                                # Phase 25
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -455,20 +494,26 @@ def main(config: EAHNConfig):
             if (batch_idx + 1) % 1000 == 0 or (batch_idx + 1) == total_batches:
                 n = max(run["n"], 1)
                 _tau = out_A.early_attn_tau  # v4: actual M_t sharpening tau
+                # Phase 25: also print refine_alpha so we can watch the
+                # bi-directional gate open across batches/epochs.
+                _alpha_now = float(getattr(out_A, "refine_alpha", 0.0))
                 print(
                     f"[E{epoch:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
                     f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
                     f"faith={run['faith']/n:.4f}  ins={run['ins']/n:.4f}  "
+                    f"tsparse={run['temp_sparse']/n:.4f}  "                # Phase 25
                     f"sparse={run['sparse']/n:.4f}  "
                     f"sharp={run['sharp']/n:.4f}  "
                     f"peak_spread={run['peak_spread']/n:.4f}  "
                     f"cons={run['cons']/n:.4f}  "
+                    f"alpha={_alpha_now:.3f}  "                            # Phase 25
                     f"tau={_tau:.3f}  sim={exp_out.inter_sample_sim:.2f}"
                 )
                 run = {
                     "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
                     "cons": 0.0, "faith": 0.0, "ins": 0.0,
+                    "temp_sparse": 0.0,                                    # Phase 25
                     "sparse": 0.0,
                     "peak_spread": 0.0, "sharp": 0.0, "n": 0,
                 }
@@ -484,6 +529,7 @@ def main(config: EAHNConfig):
         history["train_temp"].append(epoch_acc["temp"]         / n)
         history["train_faith"].append(epoch_acc["faith"]       / n)
         history["train_ins"].append(epoch_acc["ins"]           / n)   # Phase 24
+        history["train_temp_sparse"].append(epoch_acc["temp_sparse"] / n)   # Phase 25
         history["train_sparse"].append(epoch_acc["sparse"]     / n)
         history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
         history["train_sharp"].append(epoch_acc["sharp"] / n)

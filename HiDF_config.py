@@ -101,6 +101,19 @@ class EAHNConfig:
     blur_sigma:           float = 10.0    # Gaussian sigma for bottlenecked input
     bottleneck_peak_floor: float = 0.25   # Phase 22: fixed floor for bottleneck mask normalisation;
                                           # diffuse maps (peak < floor) get heavily blurred so L_faith bites
+    bottleneck_hard_topk_frac: float = 0.20  # Phase 25: when > 0, build_bottlenecked_input uses HARD
+                                             # top-K binary mask (straight-through estimator) instead of
+                                             # soft blur.  K = frac * H * W (typical 0.20 → keep 20% of pixels).
+                                             # Aligns loss_ins / loss_faith with the insertion AUC metric.
+                                             # Set 0.0 to revert to Phase 22/24 soft blending.
+    bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
+                                          # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
+                                          # α = sigmoid(refine_gate), refine_gate initialised at -2.0
+                                          # (α ≈ 0.12) so early training behaves like Phase 24.  Set
+                                          # False to revert to Phase 24 (early-only attention).
+    lambda_temp_sparse:   float = 0.05    # Phase 25: weight for temporal_sparsity_loss on M_frame.
+                                          # Pushes temporal_gate toward peaky output so k1/k2/k4
+                                          # ratios > 1.0.  Shares faith_warmup_epochs ramp.
     snapshot_every:       int   = 2       # save snapshot every N epochs
 
     # ── Device ────────────────────────────────────────────────────────────────
@@ -248,6 +261,23 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 22: fixed absolute floor for bottleneck mask normalisation "
                              "(default 0.25). Diffuse maps whose peak < floor get blurred harder, "
                              "so the faithfulness loss bites even before sharpening converges.")
+    parser.add_argument("--bottleneck_hard_topk_frac", type=float, default=None,
+                        help="Phase 25: when > 0 (typical 0.20), bottleneck uses a HARD top-K binary "
+                             "mask via straight-through estimator instead of the soft blur. Aligns "
+                             "loss_ins / loss_faith training signal with the insertion-AUC metric. "
+                             "Set 0.0 to revert to Phase 22/24 soft behaviour.")
+    parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
+                        action="store_true", default=None,
+                        help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "
+                             "produces a refined M_t from transformer-context Q, blended with the "
+                             "early M_t via learnable sigmoid gate.")
+    parser.add_argument("--no_bidirectional", dest="bidirectional_enabled",
+                        action="store_false",
+                        help="Phase 25: disable bi-directional refinement (use only early M_t).")
+    parser.add_argument("--lambda_temp_sparse", type=float, default=None,
+                        help="Phase 25: weight for temporal_sparsity_loss on M_frame "
+                             "(default 0.05). Pushes temporal_gate toward peaky M_frame so "
+                             "k1/k2/k4 frame-drop ratios exceed 1.0x.")
     parser.add_argument("--snapshot_every", type=int, default=None,
                         help="Save Phase 21 snapshot every N epochs (default 2).")
     parser.add_argument("--no_early_stop", dest="no_early_stop",
