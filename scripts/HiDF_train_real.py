@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import GradScaler, autocast
 
 from HiDF_config import EAHNConfig, parse_args
@@ -45,6 +45,7 @@ from losses.HiDF_explanation import (
     faithfulness_loss,
     sparsity_loss,
     temporal_sparsity_loss,       # Phase 25: pushes M_frame to be peaky → k1/k2/k4 > 1
+    cbm_diversity_loss,           # Phase 26: slot diversity (re-export wrapper)
 )
 from losses.HiDF_temporal import TemporalConsistencyLoss
 from metrics.HiDF_detection import DetectionMetrics
@@ -79,25 +80,71 @@ def main(config: EAHNConfig):
     val_ds   = DeepfakeDataset(config, "val",   config.dataset_name)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    # ── DataLoader — Regime A: plain shuffle, no sampler ─────────────────────
-    print("[Sampler] Mode=shuffled  (WeightedRandomSampler DISABLED for Regime A)")
+    # ── DataLoader — Phase 26: class-balanced sampler optional ──────────────
+    # Phase 25 evidence: with plain shuffle on HiDF (real:fake = 3488:3175
+    # = 1.10:1) plus the over-amplified Phase 25 hyperparameters, the model
+    # collapsed to predicting "fake" for 86% of real samples.
+    # WeightedRandomSampler with weight = 1/n_class per sample equalises the
+    # expected per-batch class ratio and is the cheapest defense against
+    # this failure mode.  Set --no_class_balanced_sampler to revert to
+    # Regime A.
     _train_generator = torch.Generator()
     _train_generator.manual_seed(42)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=config.batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        collate_fn=deepfake_collate_fn,
-        pin_memory=(config.device == "cuda"),
-        persistent_workers=(config.num_workers > 0),
-        drop_last=True,
-        generator=_train_generator,
-    )
-    print(
-        f"[DataLoader] batch_size={config.batch_size}  shuffle=True  "
-        f"num_workers={config.num_workers}  drop_last=True  generator=seed42"
-    )
+    _use_cb_sampler = bool(getattr(config, "class_balanced_sampler", True))
+
+    if _use_cb_sampler:
+        # Compute per-sample weight = 1 / count(class_of_sample)
+        _labels_arr = np.array(
+            [s["label"] for s in train_ds.samples], dtype=int
+        )
+        _n_real = int((_labels_arr == 0).sum())
+        _n_fake = int((_labels_arr == 1).sum())
+        # Inverse-class-frequency weights
+        _w = np.where(_labels_arr == 0, 1.0 / max(_n_real, 1),
+                                         1.0 / max(_n_fake, 1))
+        _w_t = torch.as_tensor(_w, dtype=torch.double)
+        _sampler = WeightedRandomSampler(
+            weights=_w_t,
+            num_samples=len(train_ds),     # one epoch = one pass over dataset
+            replacement=True,
+            generator=_train_generator,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=config.batch_size,
+            sampler=_sampler,              # shuffle MUST be off when sampler is given
+            num_workers=config.num_workers,
+            collate_fn=deepfake_collate_fn,
+            pin_memory=(config.device == "cuda"),
+            persistent_workers=(config.num_workers > 0),
+            drop_last=True,
+        )
+        print(
+            f"[Sampler] Phase 26: WeightedRandomSampler enabled "
+            f"(real={_n_real} w={1.0/max(_n_real,1):.6f}, "
+            f"fake={_n_fake} w={1.0/max(_n_fake,1):.6f})"
+        )
+        print(
+            f"[DataLoader] batch_size={config.batch_size}  sampler=weighted  "
+            f"num_workers={config.num_workers}  drop_last=True"
+        )
+    else:
+        print("[Sampler] Mode=shuffled  (WeightedRandomSampler DISABLED — Phase 24 behaviour)")
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            collate_fn=deepfake_collate_fn,
+            pin_memory=(config.device == "cuda"),
+            persistent_workers=(config.num_workers > 0),
+            drop_last=True,
+            generator=_train_generator,
+        )
+        print(
+            f"[DataLoader] batch_size={config.batch_size}  shuffle=True  "
+            f"num_workers={config.num_workers}  drop_last=True  generator=seed42"
+        )
     val_loader = DataLoader(
         val_ds, batch_size=config.batch_size,
         num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
@@ -199,6 +246,8 @@ def main(config: EAHNConfig):
         "train_faith":         [], "train_sparse": [],
         "train_ins":           [],                      # Phase 24: insertion-AUC training loss
         "train_temp_sparse":   [],                      # Phase 25: temporal-gate sparsity
+        "train_cbm_aux":       [],                      # Phase 26: CBM auxiliary cls loss
+        "train_cbm_div":       [],                      # Phase 26: CBM slot diversity loss
         "train_peak_spread":   [],                      # v2: new term
         "train_sharp":         [],                      # v3: sharpness loss
         "val_auc_roc":         [], "val_balanced_acc":      [],
@@ -266,6 +315,7 @@ def main(config: EAHNConfig):
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "faith": 0.0, "ins": 0.0,                   # Phase 24
             "temp_sparse": 0.0,                          # Phase 25
+            "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
@@ -274,6 +324,7 @@ def main(config: EAHNConfig):
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "cons": 0.0, "faith": 0.0, "ins": 0.0,      # Phase 24
             "temp_sparse": 0.0,                          # Phase 25
+            "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "sparse": 0.0, "peak_spread": 0.0,
             "sharp": 0.0, "n": 0,
         }
@@ -339,6 +390,23 @@ def main(config: EAHNConfig):
                     loss_ins         = torch.zeros((), device=frames.device)
                     loss_temp_sparse = torch.zeros((), device=frames.device)
 
+                # ── Phase 26: Concept Slot Bottleneck auxiliary losses ────────
+                # The CBM head's logit is already blended into out_A.logit, so
+                # loss_cls trains both classifier paths jointly.  These two
+                # auxiliary losses *additionally*:
+                #   1. supervise the CBM head alone (loss_cbm_aux), so the K
+                #      concept scores carry real predictive signal even before
+                #      the blend learns to weight them in;
+                #   2. push the K slot attention vectors apart (loss_cbm_div),
+                #      preventing the slots from collapsing onto the same
+                #      spatial-temporal positions.
+                if getattr(config, "cbm_enabled", True) and out_A.cbm_logit is not None:
+                    loss_cbm_aux = cls_loss_fn(out_A.cbm_logit, labels)
+                    loss_cbm_div = cbm_diversity_loss(out_A.slot_attn)
+                else:
+                    loss_cbm_aux = torch.zeros((), device=frames.device)
+                    loss_cbm_div = torch.zeros((), device=frames.device)
+
                 # ── Explanation + temporal ────────────────────────────────────
                 exp_out = exp_loss_fn(M_t)
                 l_exp   = exp_out.loss
@@ -378,6 +446,12 @@ def main(config: EAHNConfig):
                     float(getattr(config, "lambda_temp_sparse", 0.05)),
                 )
 
+                # Phase 26: CBM weight hyperparameters (no warmup — CBM is a
+                # parallel head that benefits from learning concept structure
+                # from epoch 1).  Defaults: lambda_cbm_aux=0.10, lambda_cbm_div=0.05.
+                _lam_cbm_aux = float(getattr(config, "lambda_cbm_aux", 0.10))
+                _lam_cbm_div = float(getattr(config, "lambda_cbm_div", 0.05))
+
                 l_total = (loss_cls
                            + lam_faith_eff          * loss_faith
                            + lam_ins_eff            * loss_ins
@@ -386,7 +460,9 @@ def main(config: EAHNConfig):
                            + _lambda1_eff            * l_exp
                            + config.lambda2          * l_temp
                            + _lambda_peak_spread     * l_peak_spread
-                           + _lambda_sharp           * loss_sharp)
+                           + _lambda_sharp           * loss_sharp
+                           + _lam_cbm_aux            * loss_cbm_aux       # Phase 26
+                           + _lam_cbm_div            * loss_cbm_div)      # Phase 26
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
@@ -454,6 +530,16 @@ def main(config: EAHNConfig):
                       f"refine_gate={model.refine_gate.item():.4f}  "
                       f"hard_topk_frac={_hard_topk:.3f}  "
                       f"frame_attn_tau={out_A.frame_attn_tau:.4f}")
+                # Phase 26: CBM diagnostic
+                _cbm_on    = bool(getattr(config, "cbm_enabled", True))
+                _cbm_blend = float(getattr(out_A, "cbm_blend", 0.0))
+                _cbm_K     = int(getattr(config, "cbm_num_slots", 8))
+                print(f"[DIAG-P26] cbm_enabled={_cbm_on}  K={_cbm_K}  "
+                      f"L_cbm_aux={loss_cbm_aux.item():.6f}  "
+                      f"L_cbm_div={loss_cbm_div.item():.6f}  "
+                      f"cbm_blend={_cbm_blend:.4f}  "
+                      f"(main weight={_cbm_blend:.2f}, cbm weight={1-_cbm_blend:.2f})  "
+                      f"class_balanced_sampler={_use_cb_sampler}")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -470,6 +556,8 @@ def main(config: EAHNConfig):
             _lf  = loss_faith.item()
             _li  = loss_ins.item()                        # Phase 24
             _lts = loss_temp_sparse.item()                # Phase 25
+            _lca = loss_cbm_aux.item()                    # Phase 26
+            _lcd = loss_cbm_div.item()                    # Phase 26
             _ls  = loss_sparse.item()
             _lps = l_peak_spread.item()
             _lsh = loss_sharp.item()
@@ -479,6 +567,8 @@ def main(config: EAHNConfig):
             run["cons"]        += _lco
             run["faith"]       += _lf;  run["ins"]    += _li     # Phase 24
             run["temp_sparse"] += _lts                            # Phase 25
+            run["cbm_aux"]     += _lca                            # Phase 26
+            run["cbm_div"]     += _lcd                            # Phase 26
             run["sparse"]      += _ls
             run["peak_spread"] += _lps; run["sharp"]  += _lsh; run["n"] += 1
 
@@ -486,6 +576,8 @@ def main(config: EAHNConfig):
             epoch_acc["exp"]         += _le;  epoch_acc["temp"]   += _lp
             epoch_acc["faith"]       += _lf;  epoch_acc["ins"]    += _li   # Phase 24
             epoch_acc["temp_sparse"] += _lts                                # Phase 25
+            epoch_acc["cbm_aux"]     += _lca                                # Phase 26
+            epoch_acc["cbm_div"]     += _lcd                                # Phase 26
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -496,24 +588,31 @@ def main(config: EAHNConfig):
                 _tau = out_A.early_attn_tau  # v4: actual M_t sharpening tau
                 # Phase 25: also print refine_alpha so we can watch the
                 # bi-directional gate open across batches/epochs.
+                # Phase 26: also print cbm_blend so we can watch the CBM head
+                # gain weight (or not) as training proceeds.
                 _alpha_now = float(getattr(out_A, "refine_alpha", 0.0))
+                _blend_now = float(getattr(out_A, "cbm_blend", 0.0))
                 print(
                     f"[E{epoch:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
                     f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
                     f"faith={run['faith']/n:.4f}  ins={run['ins']/n:.4f}  "
                     f"tsparse={run['temp_sparse']/n:.4f}  "                # Phase 25
+                    f"cbm_aux={run['cbm_aux']/n:.4f}  "                    # Phase 26
+                    f"cbm_div={run['cbm_div']/n:.4f}  "                    # Phase 26
                     f"sparse={run['sparse']/n:.4f}  "
                     f"sharp={run['sharp']/n:.4f}  "
                     f"peak_spread={run['peak_spread']/n:.4f}  "
                     f"cons={run['cons']/n:.4f}  "
                     f"alpha={_alpha_now:.3f}  "                            # Phase 25
+                    f"blend={_blend_now:.3f}  "                            # Phase 26
                     f"tau={_tau:.3f}  sim={exp_out.inter_sample_sim:.2f}"
                 )
                 run = {
                     "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
                     "cons": 0.0, "faith": 0.0, "ins": 0.0,
                     "temp_sparse": 0.0,                                    # Phase 25
+                    "cbm_aux": 0.0, "cbm_div": 0.0,                        # Phase 26
                     "sparse": 0.0,
                     "peak_spread": 0.0, "sharp": 0.0, "n": 0,
                 }
@@ -530,6 +629,8 @@ def main(config: EAHNConfig):
         history["train_faith"].append(epoch_acc["faith"]       / n)
         history["train_ins"].append(epoch_acc["ins"]           / n)   # Phase 24
         history["train_temp_sparse"].append(epoch_acc["temp_sparse"] / n)   # Phase 25
+        history["train_cbm_aux"].append(epoch_acc["cbm_aux"]   / n)   # Phase 26
+        history["train_cbm_div"].append(epoch_acc["cbm_div"]   / n)   # Phase 26
         history["train_sparse"].append(epoch_acc["sparse"]     / n)
         history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
         history["train_sharp"].append(epoch_acc["sharp"] / n)

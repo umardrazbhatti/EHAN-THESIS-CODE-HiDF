@@ -284,6 +284,21 @@ def sparsity_loss(M_t: torch.Tensor) -> torch.Tensor:
     return -M_t.amax(dim=(-2, -1)).mean()
 
 
+def cbm_diversity_loss(slot_attn: torch.Tensor) -> torch.Tensor:
+    """Phase 26: re-export of ConceptSlotBottleneck.slot_diversity_loss so
+    scripts/HiDF_train_real.py can import everything from this module.
+
+    Computes mean off-diagonal cosine similarity between K slot attention
+    distributions per sample.  Minimised → slots attend to different
+    spatial-temporal positions, preventing K-way attention collapse.
+
+    slot_attn : (B, K, L)  where L = T * N
+    Returns scalar tensor in [0, 1].
+    """
+    from models.HiDF_concept_bottleneck import slot_diversity_loss as _impl
+    return _impl(slot_attn)
+
+
 def temporal_sparsity_loss(M_frame: torch.Tensor) -> torch.Tensor:
     """Phase 25: negative mean peak-weight per sample — pushes temporal_gate
     toward peaky M_frame.

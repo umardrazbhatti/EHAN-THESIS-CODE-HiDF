@@ -108,12 +108,33 @@ class EAHNConfig:
                                              # Set 0.0 to revert to Phase 22/24 soft blending.
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
-                                          # α = sigmoid(refine_gate), refine_gate initialised at -2.0
-                                          # (α ≈ 0.12) so early training behaves like Phase 24.  Set
-                                          # False to revert to Phase 24 (early-only attention).
-    lambda_temp_sparse:   float = 0.05    # Phase 25: weight for temporal_sparsity_loss on M_frame.
-                                          # Pushes temporal_gate toward peaky output so k1/k2/k4
-                                          # ratios > 1.0.  Shares faith_warmup_epochs ramp.
+                                          # α = sigmoid(refine_gate).  Phase 26: refine_gate init
+                                          # raised from -2.0 to -0.5 (sigmoid -2.0 = 0.119 vs -0.5
+                                          # = 0.378) so the bidirectional path actually engages from
+                                          # epoch 1 — in Phase 25 alpha only crept 0.118 → 0.121
+                                          # across all 8 epochs and the gate never opened.
+    refine_gate_init:       float = -0.5   # Phase 26: initial value of refine_gate parameter; sigmoid
+                                           # gives alpha. -0.5 → alpha=0.378 (engaged from start).
+    lambda_temp_sparse:   float = 0.02    # Phase 25: weight for temporal_sparsity_loss on M_frame.
+                                          # Phase 26: gentled from 0.05 → 0.02 (was driving M_frame
+                                          # to one-hot on frame 0).  Still shares faith_warmup_epochs.
+    # ── Phase 26: Concept Slot Bottleneck (CBM) ──────────────────────────────
+    # K=8 learned slot queries each compute a soft attention over (T*N)
+    # transformer features → pooled vector → scalar concept score.  Final CBM
+    # logit = Linear(K → 1).  Combined with main classifier via a learnable
+    # sigmoid blend (init 0.5).  Loss adds:
+    #   - lambda_cbm_aux * cls_loss(cbm_logit, label)       — supervise CBM head
+    #   - lambda_cbm_div * mean(off-diag cosine similarity) — push slots apart
+    # Cheap (~4k extra params, ~1-2% wall-clock overhead).
+    cbm_enabled:           bool  = True
+    cbm_num_slots:         int   = 8     # K — number of concept slots
+    lambda_cbm_aux:        float = 0.10  # weight on CBM auxiliary classification loss
+    lambda_cbm_div:        float = 0.05  # weight on slot diversity loss
+    # ── Phase 26: Class-balanced sampler ─────────────────────────────────────
+    # WeightedRandomSampler with weight = 1/n_class per sample. Combats the
+    # majority-class collapse seen in Phase 25 (real_acc 0.142 = model
+    # defaulted to always-fake). Default ON for HiDF (real:fake ≈ 1.10:1).
+    class_balanced_sampler: bool = True
     snapshot_every:       int   = 2       # save snapshot every N epochs
 
     # ── Device ────────────────────────────────────────────────────────────────
@@ -276,8 +297,33 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 25: disable bi-directional refinement (use only early M_t).")
     parser.add_argument("--lambda_temp_sparse", type=float, default=None,
                         help="Phase 25: weight for temporal_sparsity_loss on M_frame "
-                             "(default 0.05). Pushes temporal_gate toward peaky M_frame so "
+                             "(default 0.02). Pushes temporal_gate toward peaky M_frame so "
                              "k1/k2/k4 frame-drop ratios exceed 1.0x.")
+    parser.add_argument("--refine_gate_init", type=float, default=None,
+                        help="Phase 26: initial value of bidirectional refine_gate parameter. "
+                             "alpha = sigmoid(refine_gate_init). Default -0.5 → alpha=0.378 so "
+                             "the bidirectional path engages from epoch 1.")
+    # ── Phase 26: Concept Slot Bottleneck ────────────────────────────────
+    parser.add_argument("--cbm_enabled", dest="cbm_enabled",
+                        action="store_true", default=None,
+                        help="Phase 26: enable Concept Slot Bottleneck head (K=8 learned slot "
+                             "queries → concept scores → parallel classifier blended with main).")
+    parser.add_argument("--no_cbm", dest="cbm_enabled", action="store_false",
+                        help="Phase 26: disable CBM head; revert to Phase 25 architecture.")
+    parser.add_argument("--cbm_num_slots", type=int, default=None,
+                        help="Phase 26: number of CBM concept slots K (default 8).")
+    parser.add_argument("--lambda_cbm_aux", type=float, default=None,
+                        help="Phase 26: weight on CBM auxiliary classification loss (default 0.10).")
+    parser.add_argument("--lambda_cbm_div", type=float, default=None,
+                        help="Phase 26: weight on slot diversity loss (default 0.05).")
+    # ── Phase 26: Class-balanced sampler ─────────────────────────────────
+    parser.add_argument("--class_balanced_sampler", dest="class_balanced_sampler",
+                        action="store_true", default=None,
+                        help="Phase 26: use WeightedRandomSampler with inverse-class-frequency "
+                             "weights to combat majority-class collapse (default True).")
+    parser.add_argument("--no_class_balanced_sampler", dest="class_balanced_sampler",
+                        action="store_false",
+                        help="Phase 26: disable class-balanced sampler; use plain shuffle.")
     parser.add_argument("--snapshot_every", type=int, default=None,
                         help="Save Phase 21 snapshot every N epochs (default 2).")
     parser.add_argument("--no_early_stop", dest="no_early_stop",

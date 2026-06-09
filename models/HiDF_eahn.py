@@ -27,6 +27,7 @@ from HiDF_config import EAHNConfig
 from models.HiDF_spatial_stream import SpatialStream
 from models.HiDF_temporal_stream import TemporalStream
 from models.HiDF_cross_attention import CrossAttentionFusion
+from models.HiDF_concept_bottleneck import ConceptSlotBottleneck   # Phase 26
 
 
 @dataclass
@@ -53,6 +54,20 @@ class EAHNOutput:
     # 0.0 when bidirectional_enabled=False.  Logged in first-batch diagnostics
     # so we can confirm the refinement gate is opening across epochs.
     refine_alpha:   float = 0.0
+    # ── Phase 26: CBM (Concept Slot Bottleneck) outputs ──────────────────────
+    # cbm_logit       : (B,)       parallel CBM head's prediction
+    # main_logit      : (B,)       the original classifier head's logit
+    #                              (kept separately so loss/metric code can pick)
+    # concept_scores  : (B, K)     per-concept scalar activations
+    # slot_attn       : (B, K, T*N) per-slot soft attention over flattened (T*N)
+    #                              positions — exposed for diagnostics + diversity loss
+    # cbm_blend       : float      sigmoid(blend), fraction of MAIN in combined logit
+    # All are zero/None when cbm_enabled=False.
+    cbm_logit:       torch.Tensor = None
+    main_logit:      torch.Tensor = None
+    concept_scores:  torch.Tensor = None
+    slot_attn:       torch.Tensor = None
+    cbm_blend:       float = 0.0
 
 
 class EarlyAttnHead(nn.Module):
@@ -165,10 +180,31 @@ class EAHN(nn.Module):
         self.bidirectional_enabled = bool(
             getattr(config, "bidirectional_enabled", True)
         )
-        self.refine_gate = nn.Parameter(torch.tensor(-2.0))   # sigmoid(-2)≈0.119
+        # Phase 26: refine_gate init raised from -2.0 to -0.5 (sigmoid 0.119 →
+        # 0.378) so the bidirectional path actually engages from epoch 1.
+        # Phase 25 evidence: alpha only crept 0.118 → 0.121 over 8 epochs,
+        # never exceeding the init value, because every other knob was
+        # destabilising training before the gate could open.
+        _refine_init = float(getattr(config, "refine_gate_init", -0.5))
+        self.refine_gate = nn.Parameter(torch.tensor(_refine_init))
 
         # ── Classification Head ───────────────────────────────────────────────
         self.classifier = nn.Linear(d, 1)
+
+        # ── Phase 26: Concept Slot Bottleneck (parallel interpretable head) ──
+        # K learned slot queries → soft-attention over (T*N) transformer
+        # features → K scalar concept scores → Linear(K → 1) parallel logit.
+        # Combined with main logit via learnable sigmoid blend (init 0.5).
+        # See models/HiDF_concept_bottleneck.py for full description.
+        self.cbm_enabled = bool(getattr(config, "cbm_enabled", True))
+        if self.cbm_enabled:
+            self.cbm = ConceptSlotBottleneck(
+                d_model=d,
+                num_slots=int(getattr(config, "cbm_num_slots", 8)),
+            )
+        else:
+            self.cbm = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -247,8 +283,26 @@ class EAHN(nn.Module):
             size=(H, W), mode="bilinear", align_corners=False,
         ).reshape(B, T, H, W)
 
-        logit = self.classifier(attn_pool).squeeze(-1)
-        prob  = torch.sigmoid(logit)
+        main_logit = self.classifier(attn_pool).squeeze(-1)
+
+        # ── Phase 26: Concept Slot Bottleneck (parallel interpretable head) ──
+        # The CBM reads transformer Q (B, T*N, d) — the same features the
+        # standard classifier consumes after M_t-gated pooling, but BEFORE the
+        # temporal_gate has collapsed the time axis.  This lets the slots
+        # attend to (frame, position) pairs and discover spatio-temporal
+        # concepts that the temporal_gate's single-vector pool would smear.
+        if self.cbm is not None:
+            Q_flat = Q.reshape(B, T * N, d)
+            cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(Q_flat)
+            # Combined logit: sigmoid(blend) * main + (1-sigmoid(blend)) * cbm
+            # blend init 0.0 → 50/50 at start; model learns the right ratio.
+            beta_main = torch.sigmoid(self.cbm.blend)
+            logit = beta_main * main_logit + (1.0 - beta_main) * cbm_logit
+        else:
+            cbm_logit, concept_scores, slot_attn, cbm_blend = None, None, None, 0.0
+            logit = main_logit
+
+        prob = torch.sigmoid(logit)
 
         return EAHNOutput(
             logit=logit, prob=prob,
@@ -260,4 +314,9 @@ class EAHN(nn.Module):
             M_frame=M_frame,
             frame_attn_tau=float(_tau_frame.item()),
             refine_alpha=_alpha_val,
+            cbm_logit=cbm_logit,
+            main_logit=main_logit,
+            concept_scores=concept_scores,
+            slot_attn=slot_attn,
+            cbm_blend=cbm_blend,
         )
