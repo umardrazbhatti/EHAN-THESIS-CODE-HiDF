@@ -44,7 +44,10 @@ except ImportError:
     )
 
 from data.HiDF_face_align import FaceAligner
-from data.HiDF_transforms import get_transforms, get_heavy_transforms, get_real_aug_transforms
+from data.HiDF_transforms import (
+    get_transforms, get_heavy_transforms, get_real_aug_transforms,
+    get_domain_transform,                 # Phase 27: DANN synthetic domains
+)
 from data.HiDF_synthetic_generator import SyntheticDataGenerator
 
 # ---------------------------------------------------------------------------
@@ -503,15 +506,30 @@ class DeepfakeDataset(Dataset):
         video_id  = os.path.splitext(os.path.basename(sample["video_path"]))[0]
         frames_np = self.face_aligner.align_frames(frames_np, video_id)
 
-        # ── Per-class transform selection ─────────────────────────────────────
-        # Priority:
+        # ── Per-class + Phase-27 domain transform selection ──────────────────
+        # Priority (unchanged from Phase 26):
         #   1. Heavy aug for minority-class samples under severe imbalance (ratio > 3:1)
-        #   2. Real-specific aug for all real training samples: RandomGrayscale + GaussianBlur
-        #      break per-video camera/compression identity shortcuts (see HiDF_transforms.py)
+        #   2. Real-specific aug for all real training samples: RandomGrayscale +
+        #      GaussianBlur break per-video camera/compression identity shortcuts
         #   3. Standard train transform for all other training samples
         #   4. Val/test transform (deterministic) outside training
+        #
+        # Phase 27 (DANN, train mode only):
+        #   When config.dann_enabled is True, override the above with a randomly
+        #   chosen synthetic-domain transform from
+        #   {clean, heavy-JPEG, noise, blur}.  Domain id is recorded so the
+        #   collate can pass it through to the model for the DANN domain loss.
+        #   Val/test always run the deterministic clean transform with
+        #   domain = -1 (sentinel: domain head still emits logits but is
+        #   ignored by the loss).
         label = sample["label"]
-        if self.mode == "train" and self.heavy_aug and label == self.minority_class:
+        _dann_enabled  = bool(getattr(self.config, "dann_enabled", False))
+        _num_domains   = int(getattr(self.config, "num_domains", 4))
+        domain_id      = -1                   # sentinel for non-train branches
+        if self.mode == "train" and _dann_enabled:
+            domain_id = random.randint(0, _num_domains - 1)
+            aug = get_domain_transform(domain_id, self.config.frame_size)
+        elif self.mode == "train" and self.heavy_aug and label == self.minority_class:
             aug = get_heavy_transforms(self.config.frame_size)
         elif self.mode == "train" and label == 0:
             aug = get_real_aug_transforms(self.config.frame_size)
@@ -525,6 +543,7 @@ class DeepfakeDataset(Dataset):
         result = {
             "frames": frames_tensor,
             "label":  label,
+            "domain": domain_id,        # Phase 27: -1 sentinel outside train
             "meta": {
                 "video_path":    sample["video_path"],
                 "frame_indices": [],

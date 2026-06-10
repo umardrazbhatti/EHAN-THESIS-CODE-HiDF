@@ -119,22 +119,40 @@ class EAHNConfig:
                                           # Phase 26: gentled from 0.05 → 0.02 (was driving M_frame
                                           # to one-hot on frame 0).  Still shares faith_warmup_epochs.
     # ── Phase 26: Concept Slot Bottleneck (CBM) ──────────────────────────────
-    # K=8 learned slot queries each compute a soft attention over (T*N)
-    # transformer features → pooled vector → scalar concept score.  Final CBM
-    # logit = Linear(K → 1).  Combined with main classifier via a learnable
-    # sigmoid blend (init 0.5).  Loss adds:
-    #   - lambda_cbm_aux * cls_loss(cbm_logit, label)       — supervise CBM head
-    #   - lambda_cbm_div * mean(off-diag cosine similarity) — push slots apart
-    # Cheap (~4k extra params, ~1-2% wall-clock overhead).
+    # Phase 27 NOTE: cbm_serial=True changes the wiring -- cbm_logit becomes
+    # the SOLE prediction (no main/CBM blend), main_logit is supervised only
+    # as a regulariser via lambda_cbm_main_aux.  K bumped 8 -> 12 because the
+    # serial bottleneck must carry the full prediction.
     cbm_enabled:           bool  = True
-    cbm_num_slots:         int   = 8     # K — number of concept slots
-    lambda_cbm_aux:        float = 0.10  # weight on CBM auxiliary classification loss
-    lambda_cbm_div:        float = 0.05  # weight on slot diversity loss
+    cbm_serial:            bool  = True   # Phase 27: serial vs Phase 26 parallel
+    cbm_num_slots:         int   = 12     # Phase 27: K = 12 (was 8 in Phase 26)
+    lambda_cbm_aux:        float = 0.10   # weight on CBM auxiliary classification loss
+    lambda_cbm_div:        float = 0.05   # weight on slot diversity loss
+    lambda_cbm_main_aux:   float = 0.05   # Phase 27: aux supervision on main_logit
+                                          # (NOT in prediction path; just a regulariser
+                                          # so we can diagnose whether attn_pool alone
+                                          # could still classify).
     # ── Phase 26: Class-balanced sampler ─────────────────────────────────────
     # WeightedRandomSampler with weight = 1/n_class per sample. Combats the
     # majority-class collapse seen in Phase 25 (real_acc 0.142 = model
     # defaulted to always-fake). Default ON for HiDF (real:fake ≈ 1.10:1).
     class_balanced_sampler: bool = True
+    # ── Phase 27: DANN (Domain Adversarial Neural Network) ────────────────────
+    # GRL(attn_pool) -> DomainHead(d, num_domains) with per-sample synthetic
+    # domain labels assigned in data/HiDF_datasets.py (random in [0, D-1])
+    # via 4 augmentation pipelines defined in data/HiDF_transforms.py:
+    #     0 = clean, 1 = heavy JPEG, 2 = noise, 3 = blur
+    # Training adds:
+    #     loss_domain = CE(domain_logits, domain_labels)
+    # weighted by lam_domain_eff (linear warmup 0 -> lambda_domain over
+    # domain_warmup_epochs).  The GRL passes -lambda_grl_eff * grad upstream,
+    # so attn_pool is pushed toward domain-invariance.  Both warmups share
+    # the same epoch count by default.
+    dann_enabled:          bool  = True
+    num_domains:           int   = 4
+    lambda_domain:         float = 0.10   # weight on domain CE loss
+    lambda_grl:            float = 1.0    # GRL scale (max after warmup)
+    domain_warmup_epochs:  int   = 3      # linear ramp for both lambda_domain and lambda_grl
     snapshot_every:       int   = 2       # save snapshot every N epochs
 
     # ── Device ────────────────────────────────────────────────────────────────
@@ -324,6 +342,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_class_balanced_sampler", dest="class_balanced_sampler",
                         action="store_false",
                         help="Phase 26: disable class-balanced sampler; use plain shuffle.")
+    # ── Phase 27: serial CBM toggle + aux supervision weight ────────────
+    parser.add_argument("--cbm_serial", dest="cbm_serial",
+                        action="store_true", default=None,
+                        help="Phase 27: serial CBM mode -- cbm_logit is the SOLE "
+                             "prediction (no main/CBM blend). main_logit is "
+                             "supervised separately as a regulariser.")
+    parser.add_argument("--no_cbm_serial", dest="cbm_serial",
+                        action="store_false",
+                        help="Phase 27: disable serial mode (Phase 26 parallel blend).")
+    parser.add_argument("--lambda_cbm_main_aux", type=float, default=None,
+                        help="Phase 27: weight on the aux supervision of main_logit "
+                             "in serial mode (default 0.05). Pure diagnostic — does "
+                             "NOT participate in prediction.")
+    # ── Phase 27: DANN flags ────────────────────────────────────────────
+    parser.add_argument("--dann_enabled", dest="dann_enabled",
+                        action="store_true", default=None,
+                        help="Phase 27: enable Domain Adversarial Training. Adds "
+                             "4 synthetic augmentation domains + DomainHead with "
+                             "GRL on attn_pool to push features toward "
+                             "domain-invariance.")
+    parser.add_argument("--no_dann", dest="dann_enabled", action="store_false",
+                        help="Phase 27: disable DANN entirely (single-domain training).")
+    parser.add_argument("--num_domains", type=int, default=None,
+                        help="Phase 27: number of synthetic DANN domains (default 4).")
+    parser.add_argument("--lambda_domain", type=float, default=None,
+                        help="Phase 27: weight on domain CE loss (default 0.10). "
+                             "Warmed up linearly over domain_warmup_epochs.")
+    parser.add_argument("--lambda_grl", type=float, default=None,
+                        help="Phase 27: max GRL gradient scale (default 1.0). "
+                             "Warmed up linearly over domain_warmup_epochs.")
+    parser.add_argument("--domain_warmup_epochs", type=int, default=None,
+                        help="Phase 27: epochs for linear warmup of lambda_domain "
+                             "and lambda_grl (default 3).")
     parser.add_argument("--snapshot_every", type=int, default=None,
                         help="Save Phase 21 snapshot every N epochs (default 2).")
     parser.add_argument("--no_early_stop", dest="no_early_stop",

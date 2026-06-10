@@ -1,50 +1,58 @@
 """
-models/HiDF_concept_bottleneck.py — Phase 26 Concept Slot Bottleneck.
+models/HiDF_concept_bottleneck.py — Phase 26+27 Concept Slot Bottleneck.
 
-Adds a parallel interpretable head to the EAHN classifier:
+PHASE 26 (parallel head — DEPRECATED): cbm was wired alongside the main
+classifier and blended via a learnable sigmoid gate. Result: the model
+escaped through the main path, M_t got decoupled from prediction, and
+faithfulness_corr regressed (0.225 -> 0.079 over 8 epochs).
+
+PHASE 27 (serial bottleneck — current): the CBM is the SOLE classifier
+path. The main Linear(d -> 1) head still exists but is used only as an
+auxiliary supervision signal (lambda_cbm_main_aux, small weight) and its
+output is exposed as `main_logit` for diagnostics — it is NOT part of the
+prediction `out.logit`. This forces all gradient through the K-concept
+bottleneck and removes the escape hatch.
 
   Transformer Q (B, T*N, d)
         │
-        ├─ K=8 learned slot queries → soft-attention over (T*N) positions
-        │   → K pooled vectors (B, K, d)
-        │   → K scalar concept scores (B, K)
-        │   → Linear(K → 1)            ─── CBM logit
-        │
-        └─ existing M_t + temporal_gate path ── main logit
+        └─ K learned slot queries -> soft-attention over (T*N) positions
+            -> K pooled vectors (B, K, d)
+            -> K scalar concept scores (B, K)
+            -> Linear(K -> 1)            ─── cbm_logit = out.logit  (PRIMARY)
 
-  final_logit = sigmoid(blend) * main_logit + (1 - sigmoid(blend)) * cbm_logit
+  attn_pool (B, d) -> Linear(d -> 1) -> main_logit  (DIAGNOSTIC AUX ONLY)
 
-WHY THIS IMPROVES FAITHFULNESS
-  The standard classifier reads a single 256-D pooled vector and predicts;
-  there's no architectural reason for any specific spatial cell to be
-  "important" — the classifier can rebalance arbitrary linear combinations.
+WHY SERIAL IS THE CORRECT DESIGN
+  Phase 26 evidence: when both paths exist with a sigmoid blend, the
+  classifier learns to mix them in whatever way minimises loss without
+  caring whether M_t is informative.  Slot attention learns concepts but
+  they live in a separate gradient lane.
 
-  CBM forces prediction through K=8 scalar bottlenecks.  Each slot attention
-  map is therefore exposed as "the evidence behind concept k."  Since the
-  classifier can only see those K scalars (no other path), the slot
-  attention IS causally coupled to the prediction.
+  Serial means: prediction = f(K concept scores) only.  K concept scores
+  are computed via slot attention over Q, which is gated by M_t.  So the
+  gradient of prediction w.r.t. input pixels MUST flow through the slots
+  and the M_t-gated tokens.  Faithfulness (corr between M_t and gradient
+  saliency) is now coupled by construction.
 
-  Slot diversity loss (mean off-diagonal cosine similarity between slot
-  attention vectors) keeps the K slots from collapsing to the same region
-  — the bottleneck must distribute its evidence across distinct concepts.
-
-  Net effect on the faithfulness metric (Spearman corr between intrinsic
-  M_t and gradient saliency): the model now MUST route gradient through
-  the same regions M_t highlights, otherwise CBM concepts have no signal.
-
-PARAMETER COST
-  slot_q: (K, d) = 8 * 256 = 2048
-  slot_v: (K, d) = 8 * 256 = 2048
-  fc.weight: (1, K)        = 8
-  blend:                   = 1
+PARAMETER COST  (K=12 for Phase 27)
+  slot_q: (K, d) = 12 * 256 = 3072
+  slot_v: (K, d) = 12 * 256 = 3072
+  fc.weight: (1, K)        = 12
+  fc.bias                   = 1
   ─────────────────────────
-  total: ~4,105 params (0.02% of EfficientNet-B4 backbone)
+  total: ~6,160 params (0.03% of EfficientNet-B4 backbone)
 
-COMPUTE COST
-  Slot attention: B * K * (T*N) * d  flops  =  2 * 8 * 784 * 256 ≈ 3.2M MACs
-  Pooling:        B * K * (T*N) * d  flops  ≈ 3.2M MACs
-  Concept scores: B * K * d                ≈ 4K  MACs
-  Total: ≈ 6.4M MACs/forward = 1-2% of full EAHN forward.
+COMPUTE COST  (K=12)
+  Slot attention: B * K * (T*N) * d  =  2 * 12 * 784 * 256 ≈ 4.8M MACs
+  Pooling:        B * K * (T*N) * d  ≈ 4.8M MACs
+  Concept scores: B * K * d           ≈ 6k  MACs
+  Total: ≈ 9.6M MACs/forward = 2-3% of full EAHN forward.
+
+NOTE
+  The `blend` parameter remains in the module for backwards compatibility
+  (load checkpoints from Phase 26) but is NOT used when caller sets
+  serial=True.  In serial mode out.cbm_blend just reports sigmoid(blend)
+  for diagnostic continuity.
 """
 
 import torch

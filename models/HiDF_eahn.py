@@ -28,6 +28,7 @@ from models.HiDF_spatial_stream import SpatialStream
 from models.HiDF_temporal_stream import TemporalStream
 from models.HiDF_cross_attention import CrossAttentionFusion
 from models.HiDF_concept_bottleneck import ConceptSlotBottleneck   # Phase 26
+from models.HiDF_grl import DomainHead, grad_reverse                # Phase 27
 
 
 @dataclass
@@ -55,19 +56,22 @@ class EAHNOutput:
     # so we can confirm the refinement gate is opening across epochs.
     refine_alpha:   float = 0.0
     # ── Phase 26: CBM (Concept Slot Bottleneck) outputs ──────────────────────
-    # cbm_logit       : (B,)       parallel CBM head's prediction
-    # main_logit      : (B,)       the original classifier head's logit
-    #                              (kept separately so loss/metric code can pick)
-    # concept_scores  : (B, K)     per-concept scalar activations
-    # slot_attn       : (B, K, T*N) per-slot soft attention over flattened (T*N)
-    #                              positions — exposed for diagnostics + diversity loss
-    # cbm_blend       : float      sigmoid(blend), fraction of MAIN in combined logit
-    # All are zero/None when cbm_enabled=False.
+    # Phase 27: in serial mode, out.logit IS cbm_logit.  main_logit is exposed
+    # for the auxiliary-supervision loss term and as a diagnostic but does NOT
+    # participate in prediction.
     cbm_logit:       torch.Tensor = None
     main_logit:      torch.Tensor = None
     concept_scores:  torch.Tensor = None
     slot_attn:       torch.Tensor = None
     cbm_blend:       float = 0.0
+    # ── Phase 27: DANN domain classifier outputs ─────────────────────────────
+    # domain_logits   : (B, num_domains)  predictions of the DANN domain head
+    #                                     fed by GRL(attn_pool).  Cross-entropy
+    #                                     with `domain` labels from the batch.
+    # cbm_serial      : bool              True when out.logit = cbm_logit
+    #                                     (no parallel-blend escape hatch).
+    domain_logits:   torch.Tensor = None
+    cbm_serial:      bool = False
 
 
 class EarlyAttnHead(nn.Module):
@@ -205,6 +209,31 @@ class EAHN(nn.Module):
         else:
             self.cbm = None
 
+        # ── Phase 27: serial CBM flag ─────────────────────────────────────────
+        # When True, out.logit = cbm_logit (no main/CBM blend).  main_logit
+        # is still exposed and supervised via lambda_cbm_main_aux, but never
+        # participates in prediction.  This removes the Phase 26 escape hatch
+        # that decoupled M_t from prediction (and tanked faithfulness 0.225 ->
+        # 0.079).  Default True; set --no_cbm_serial to revert to Phase 26
+        # parallel-blend behaviour for ablation.
+        self.cbm_serial = bool(getattr(config, "cbm_serial", True))
+
+        # ── Phase 27: DANN domain classifier ──────────────────────────────────
+        # GRL(attn_pool) -> DomainHead -> (B, D) logits.  In training the
+        # batch carries a per-sample `domain` label in [0, D-1] (random
+        # synthetic augmentation domain assigned at __getitem__).  Loss is
+        # CE on domain_logits with sign-reversed gradient flowing back to
+        # attn_pool, pushing it to be domain-invariant.
+        self.dann_enabled = bool(getattr(config, "dann_enabled", True))
+        if self.dann_enabled:
+            self.domain_head = DomainHead(
+                d_model=d,
+                num_domains=int(getattr(config, "num_domains", 4)),
+                dropout=float(getattr(config, "dropout", 0.1)),
+            )
+        else:
+            self.domain_head = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -217,7 +246,13 @@ class EAHN(nn.Module):
         if hasattr(self.spatial_stream, "set_grad_checkpointing"):
             self.spatial_stream.set_grad_checkpointing(True)
 
-    def forward(self, frames: torch.Tensor) -> EAHNOutput:
+    def forward(self, frames: torch.Tensor,
+                lambda_grl: float = 0.0) -> EAHNOutput:
+        """Phase 27: optional `lambda_grl` controls the GRL strength on the
+        DANN domain head.  Default 0.0 keeps Phase-26 behaviour (domain head
+        still runs but does NOT pull attn_pool toward invariance).  Training
+        script ramps lambda_grl 0 -> lambda_grl_max over domain_warmup_epochs.
+        """
         B, T, C, H, W = frames.shape
         frames_flat = frames.reshape(B * T, C, H, W)
 
@@ -285,24 +320,43 @@ class EAHN(nn.Module):
 
         main_logit = self.classifier(attn_pool).squeeze(-1)
 
-        # ── Phase 26: Concept Slot Bottleneck (parallel interpretable head) ──
-        # The CBM reads transformer Q (B, T*N, d) — the same features the
-        # standard classifier consumes after M_t-gated pooling, but BEFORE the
-        # temporal_gate has collapsed the time axis.  This lets the slots
-        # attend to (frame, position) pairs and discover spatio-temporal
-        # concepts that the temporal_gate's single-vector pool would smear.
+        # ── Phase 26+27: Concept Slot Bottleneck ──────────────────────────────
+        # The CBM reads transformer Q (B, T*N, d) — same features the standard
+        # classifier consumes after M_t-gated pooling, but BEFORE the temporal
+        # gate collapses time.  Slots can therefore attend to (frame, position)
+        # pairs and discover spatio-temporal concepts.
+        #
+        # Phase 27 (serial): out.logit = cbm_logit only.  main_logit is exposed
+        # for the auxiliary supervision loss (regulariser) but is NOT in the
+        # prediction path -- this removes the Phase 26 escape hatch.
         if self.cbm is not None:
             Q_flat = Q.reshape(B, T * N, d)
             cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(Q_flat)
-            # Combined logit: sigmoid(blend) * main + (1-sigmoid(blend)) * cbm
-            # blend init 0.0 → 50/50 at start; model learns the right ratio.
-            beta_main = torch.sigmoid(self.cbm.blend)
-            logit = beta_main * main_logit + (1.0 - beta_main) * cbm_logit
+            if self.cbm_serial:
+                # Phase 27: pure serial bottleneck — cbm_logit is the sole
+                # prediction.  main_logit is only used by the aux loss.
+                logit = cbm_logit
+            else:
+                # Phase 26 fallback (parallel blend, --no_cbm_serial)
+                beta_main = torch.sigmoid(self.cbm.blend)
+                logit = beta_main * main_logit + (1.0 - beta_main) * cbm_logit
         else:
             cbm_logit, concept_scores, slot_attn, cbm_blend = None, None, None, 0.0
             logit = main_logit
 
         prob = torch.sigmoid(logit)
+
+        # ── Phase 27: DANN domain head ────────────────────────────────────────
+        # Forward attn_pool through GRL(lambda) then domain head.  Training
+        # script ramps lambda from 0 over domain_warmup_epochs so the domain
+        # head learns a real signal before it starts trying to confuse the
+        # backbone.  At eval we still emit domain_logits but the training loop
+        # only uses them when labels are present.
+        if self.domain_head is not None:
+            pool_rev      = grad_reverse(attn_pool, float(lambda_grl))
+            domain_logits = self.domain_head(pool_rev)
+        else:
+            domain_logits = None
 
         return EAHNOutput(
             logit=logit, prob=prob,
@@ -319,4 +373,6 @@ class EAHN(nn.Module):
             concept_scores=concept_scores,
             slot_attn=slot_attn,
             cbm_blend=cbm_blend,
+            domain_logits=domain_logits,
+            cbm_serial=self.cbm_serial,
         )

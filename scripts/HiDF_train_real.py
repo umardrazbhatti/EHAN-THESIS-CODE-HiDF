@@ -51,6 +51,7 @@ from losses.HiDF_temporal import TemporalConsistencyLoss
 from metrics.HiDF_detection import DetectionMetrics
 from utils.HiDF_checkpointing import save_checkpoint, load_checkpoint
 from utils.HiDF_logging_utils import Logger
+from models.HiDF_grl import domain_warmup, domain_accuracy   # Phase 27
 
 
 def _faith_warmup(epoch: int, warmup_epochs: int, target: float) -> float:
@@ -248,6 +249,9 @@ def main(config: EAHNConfig):
         "train_temp_sparse":   [],                      # Phase 25: temporal-gate sparsity
         "train_cbm_aux":       [],                      # Phase 26: CBM auxiliary cls loss
         "train_cbm_div":       [],                      # Phase 26: CBM slot diversity loss
+        "train_cbm_main_aux":  [],                      # Phase 27: main_logit aux supervision
+        "train_domain":        [],                      # Phase 27: DANN domain CE loss
+        "train_domain_acc":    [],                      # Phase 27: DANN domain top-1 accuracy
         "train_peak_spread":   [],                      # v2: new term
         "train_sharp":         [],                      # v3: sharpness loss
         "val_auc_roc":         [], "val_balanced_acc":      [],
@@ -316,6 +320,8 @@ def main(config: EAHNConfig):
             "faith": 0.0, "ins": 0.0,                   # Phase 24
             "temp_sparse": 0.0,                          # Phase 25
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
+            "cbm_main_aux": 0.0,                          # Phase 27
+            "domain": 0.0, "domain_acc": 0.0,             # Phase 27
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
@@ -325,6 +331,8 @@ def main(config: EAHNConfig):
             "cons": 0.0, "faith": 0.0, "ins": 0.0,      # Phase 24
             "temp_sparse": 0.0,                          # Phase 25
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
+            "cbm_main_aux": 0.0,                          # Phase 27
+            "domain": 0.0, "domain_acc": 0.0,             # Phase 27
             "sparse": 0.0, "peak_spread": 0.0,
             "sharp": 0.0, "n": 0,
         }
@@ -334,8 +342,23 @@ def main(config: EAHNConfig):
             labels = batch["label"].to(device, non_blocking=True)
 
             with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
-                # ── Pass A: normal forward ────────────────────────────────────
-                out_A    = model(frames)
+                # ── Phase 27: DANN warmup (lambda_grl + lambda_domain) ────────
+                # Linear ramp from 0 to target over domain_warmup_epochs so the
+                # domain head learns a signal before GRL starts reversing
+                # useful gradient.
+                lam_grl_eff = domain_warmup(
+                    epoch,
+                    int(getattr(config, "domain_warmup_epochs", 3)),
+                    float(getattr(config, "lambda_grl", 1.0)),
+                )
+                lam_dom_eff = domain_warmup(
+                    epoch,
+                    int(getattr(config, "domain_warmup_epochs", 3)),
+                    float(getattr(config, "lambda_domain", 0.10)),
+                )
+
+                # ── Pass A: normal forward (with GRL strength for DANN) ───────
+                out_A    = model(frames, lambda_grl=lam_grl_eff)
                 logits_A = out_A.logit
                 M_t      = out_A.M_t          # (B, T, h, w) softmax from EarlyAttnHead
                 M_t_logits = out_A.M_t_logits  # (B, T, h, w) pre-softmax raw scores
@@ -390,22 +413,55 @@ def main(config: EAHNConfig):
                     loss_ins         = torch.zeros((), device=frames.device)
                     loss_temp_sparse = torch.zeros((), device=frames.device)
 
-                # ── Phase 26: Concept Slot Bottleneck auxiliary losses ────────
-                # The CBM head's logit is already blended into out_A.logit, so
-                # loss_cls trains both classifier paths jointly.  These two
-                # auxiliary losses *additionally*:
-                #   1. supervise the CBM head alone (loss_cbm_aux), so the K
-                #      concept scores carry real predictive signal even before
-                #      the blend learns to weight them in;
-                #   2. push the K slot attention vectors apart (loss_cbm_div),
-                #      preventing the slots from collapsing onto the same
-                #      spatial-temporal positions.
+                # ── Phase 26+27: CBM auxiliary losses ─────────────────────────
+                # Phase 27 serial mode:
+                #   out.logit IS cbm_logit, so loss_cls already trains the CBM.
+                #   loss_cbm_aux is therefore redundant with loss_cls but we
+                #   keep computing it (zero its weight via --lambda_cbm_aux 0
+                #   on the CLI if you want a clean ablation).
+                # Phase 26 parallel mode:
+                #   out.logit is the blended logit; loss_cbm_aux supervises
+                #   the CBM path alone so concepts learn even when blend
+                #   weighs them low.
+                #
+                # loss_cbm_div: K slot attention vectors should attend to
+                # different positions (push slots apart).  Independent of mode.
+                #
+                # Phase 27 main_aux: supervise main_logit even though it's
+                # never used for prediction in serial mode. Acts as a
+                # regulariser ("attn_pool should still be classifiable")
+                # and as a diagnostic of how much information lives in the
+                # M_t-gated pool.
                 if getattr(config, "cbm_enabled", True) and out_A.cbm_logit is not None:
-                    loss_cbm_aux = cls_loss_fn(out_A.cbm_logit, labels)
-                    loss_cbm_div = cbm_diversity_loss(out_A.slot_attn)
+                    loss_cbm_aux      = cls_loss_fn(out_A.cbm_logit, labels)
+                    loss_cbm_div      = cbm_diversity_loss(out_A.slot_attn)
+                    loss_cbm_main_aux = cls_loss_fn(out_A.main_logit, labels)
                 else:
-                    loss_cbm_aux = torch.zeros((), device=frames.device)
-                    loss_cbm_div = torch.zeros((), device=frames.device)
+                    loss_cbm_aux      = torch.zeros((), device=frames.device)
+                    loss_cbm_div      = torch.zeros((), device=frames.device)
+                    loss_cbm_main_aux = torch.zeros((), device=frames.device)
+
+                # ── Phase 27: DANN domain CE loss ─────────────────────────────
+                # Only the samples with domain_id >= 0 contribute. Val/test
+                # batches default to -1 sentinel and are filtered.
+                if (getattr(config, "dann_enabled", True)
+                        and out_A.domain_logits is not None
+                        and "domain" in batch):
+                    _dom_labels = batch["domain"].to(device, non_blocking=True)
+                    _valid_mask = (_dom_labels >= 0)
+                    if _valid_mask.any():
+                        loss_domain = F.cross_entropy(
+                            out_A.domain_logits[_valid_mask],
+                            _dom_labels[_valid_mask],
+                        )
+                        _dom_acc = domain_accuracy(out_A.domain_logits, _dom_labels)
+                    else:
+                        loss_domain = torch.zeros((), device=frames.device)
+                        _dom_acc    = float("nan")
+                else:
+                    loss_domain = torch.zeros((), device=frames.device)
+                    _dom_labels = None
+                    _dom_acc    = float("nan")
 
                 # ── Explanation + temporal ────────────────────────────────────
                 exp_out = exp_loss_fn(M_t)
@@ -449,8 +505,10 @@ def main(config: EAHNConfig):
                 # Phase 26: CBM weight hyperparameters (no warmup — CBM is a
                 # parallel head that benefits from learning concept structure
                 # from epoch 1).  Defaults: lambda_cbm_aux=0.10, lambda_cbm_div=0.05.
-                _lam_cbm_aux = float(getattr(config, "lambda_cbm_aux", 0.10))
-                _lam_cbm_div = float(getattr(config, "lambda_cbm_div", 0.05))
+                _lam_cbm_aux      = float(getattr(config, "lambda_cbm_aux", 0.10))
+                _lam_cbm_div      = float(getattr(config, "lambda_cbm_div", 0.05))
+                # Phase 27 auxiliary supervision on main_logit (not in prediction path)
+                _lam_cbm_main_aux = float(getattr(config, "lambda_cbm_main_aux", 0.05))
 
                 l_total = (loss_cls
                            + lam_faith_eff          * loss_faith
@@ -462,7 +520,9 @@ def main(config: EAHNConfig):
                            + _lambda_peak_spread     * l_peak_spread
                            + _lambda_sharp           * loss_sharp
                            + _lam_cbm_aux            * loss_cbm_aux       # Phase 26
-                           + _lam_cbm_div            * loss_cbm_div)      # Phase 26
+                           + _lam_cbm_div            * loss_cbm_div       # Phase 26
+                           + _lam_cbm_main_aux       * loss_cbm_main_aux  # Phase 27
+                           + lam_dom_eff             * loss_domain)       # Phase 27
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
@@ -534,12 +594,21 @@ def main(config: EAHNConfig):
                 _cbm_on    = bool(getattr(config, "cbm_enabled", True))
                 _cbm_blend = float(getattr(out_A, "cbm_blend", 0.0))
                 _cbm_K     = int(getattr(config, "cbm_num_slots", 8))
-                print(f"[DIAG-P26] cbm_enabled={_cbm_on}  K={_cbm_K}  "
+                _cbm_serial = bool(getattr(out_A, "cbm_serial", False))
+                print(f"[DIAG-P26] cbm_enabled={_cbm_on}  K={_cbm_K}  serial={_cbm_serial}  "
                       f"L_cbm_aux={loss_cbm_aux.item():.6f}  "
                       f"L_cbm_div={loss_cbm_div.item():.6f}  "
+                      f"L_cbm_main_aux={loss_cbm_main_aux.item():.6f}  "
                       f"cbm_blend={_cbm_blend:.4f}  "
-                      f"(main weight={_cbm_blend:.2f}, cbm weight={1-_cbm_blend:.2f})  "
                       f"class_balanced_sampler={_use_cb_sampler}")
+                # Phase 27: DANN diagnostic
+                _dann_on    = bool(getattr(config, "dann_enabled", True))
+                _num_dom    = int(getattr(config, "num_domains", 4))
+                print(f"[DIAG-P27] dann_enabled={_dann_on}  num_domains={_num_dom}  "
+                      f"L_domain={loss_domain.item():.6f}  "
+                      f"domain_acc={_dom_acc:.4f}  "
+                      f"lam_grl_eff={lam_grl_eff:.4f}  "
+                      f"lam_dom_eff={lam_dom_eff:.4f}")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -558,6 +627,9 @@ def main(config: EAHNConfig):
             _lts = loss_temp_sparse.item()                # Phase 25
             _lca = loss_cbm_aux.item()                    # Phase 26
             _lcd = loss_cbm_div.item()                    # Phase 26
+            _lcm = loss_cbm_main_aux.item()               # Phase 27
+            _ldm = loss_domain.item()                     # Phase 27
+            _da  = (_dom_acc if not np.isnan(_dom_acc) else 0.0)  # Phase 27
             _ls  = loss_sparse.item()
             _lps = l_peak_spread.item()
             _lsh = loss_sharp.item()
@@ -569,6 +641,9 @@ def main(config: EAHNConfig):
             run["temp_sparse"] += _lts                            # Phase 25
             run["cbm_aux"]     += _lca                            # Phase 26
             run["cbm_div"]     += _lcd                            # Phase 26
+            run["cbm_main_aux"] += _lcm                           # Phase 27
+            run["domain"]      += _ldm                            # Phase 27
+            run["domain_acc"]  += _da                             # Phase 27
             run["sparse"]      += _ls
             run["peak_spread"] += _lps; run["sharp"]  += _lsh; run["n"] += 1
 
@@ -578,6 +653,9 @@ def main(config: EAHNConfig):
             epoch_acc["temp_sparse"] += _lts                                # Phase 25
             epoch_acc["cbm_aux"]     += _lca                                # Phase 26
             epoch_acc["cbm_div"]     += _lcd                                # Phase 26
+            epoch_acc["cbm_main_aux"] += _lcm                               # Phase 27
+            epoch_acc["domain"]      += _ldm                                # Phase 27
+            epoch_acc["domain_acc"]  += _da                                 # Phase 27
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -590,6 +668,7 @@ def main(config: EAHNConfig):
                 # bi-directional gate open across batches/epochs.
                 # Phase 26: also print cbm_blend so we can watch the CBM head
                 # gain weight (or not) as training proceeds.
+                # Phase 27: domain_acc tells us if DANN is engaging.
                 _alpha_now = float(getattr(out_A, "refine_alpha", 0.0))
                 _blend_now = float(getattr(out_A, "cbm_blend", 0.0))
                 print(
@@ -600,6 +679,9 @@ def main(config: EAHNConfig):
                     f"tsparse={run['temp_sparse']/n:.4f}  "                # Phase 25
                     f"cbm_aux={run['cbm_aux']/n:.4f}  "                    # Phase 26
                     f"cbm_div={run['cbm_div']/n:.4f}  "                    # Phase 26
+                    f"cbm_main={run['cbm_main_aux']/n:.4f}  "              # Phase 27
+                    f"domain={run['domain']/n:.4f}  "                      # Phase 27
+                    f"dom_acc={run['domain_acc']/n:.3f}  "                 # Phase 27
                     f"sparse={run['sparse']/n:.4f}  "
                     f"sharp={run['sharp']/n:.4f}  "
                     f"peak_spread={run['peak_spread']/n:.4f}  "
@@ -613,6 +695,8 @@ def main(config: EAHNConfig):
                     "cons": 0.0, "faith": 0.0, "ins": 0.0,
                     "temp_sparse": 0.0,                                    # Phase 25
                     "cbm_aux": 0.0, "cbm_div": 0.0,                        # Phase 26
+                    "cbm_main_aux": 0.0,                                   # Phase 27
+                    "domain": 0.0, "domain_acc": 0.0,                      # Phase 27
                     "sparse": 0.0,
                     "peak_spread": 0.0, "sharp": 0.0, "n": 0,
                 }
@@ -631,6 +715,9 @@ def main(config: EAHNConfig):
         history["train_temp_sparse"].append(epoch_acc["temp_sparse"] / n)   # Phase 25
         history["train_cbm_aux"].append(epoch_acc["cbm_aux"]   / n)   # Phase 26
         history["train_cbm_div"].append(epoch_acc["cbm_div"]   / n)   # Phase 26
+        history["train_cbm_main_aux"].append(epoch_acc["cbm_main_aux"] / n)  # Phase 27
+        history["train_domain"].append(epoch_acc["domain"]     / n)   # Phase 27
+        history["train_domain_acc"].append(epoch_acc["domain_acc"] / n)     # Phase 27
         history["train_sparse"].append(epoch_acc["sparse"]     / n)
         history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
         history["train_sharp"].append(epoch_acc["sharp"] / n)
