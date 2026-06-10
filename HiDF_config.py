@@ -125,6 +125,13 @@ class EAHNConfig:
     # serial bottleneck must carry the full prediction.
     cbm_enabled:           bool  = True
     cbm_serial:            bool  = True   # Phase 27: serial vs Phase 26 parallel
+    cbm_coupled:           bool  = True   # Phase 28: scale CBM input tokens by
+                                          # w = M_t ⊙ M_frame (max-normalised per
+                                          # sample) so the explanation maps are
+                                          # load-bearing for the prediction.
+                                          # Phase 27 evidence: serial CBM on RAW Q
+                                          # gave detection 0.914 but k1=1.000 and
+                                          # faith_corr=0.071 — maps were decoration.
     cbm_num_slots:         int   = 12     # Phase 27: K = 12 (was 8 in Phase 26)
     lambda_cbm_aux:        float = 0.10   # weight on CBM auxiliary classification loss
     lambda_cbm_div:        float = 0.05   # weight on slot diversity loss
@@ -355,6 +362,16 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 27: weight on the aux supervision of main_logit "
                              "in serial mode (default 0.05). Pure diagnostic — does "
                              "NOT participate in prediction.")
+    # ── Phase 28: CBM-attention coupling toggle ─────────────────────────
+    parser.add_argument("--cbm_coupled", dest="cbm_coupled",
+                        action="store_true", default=None,
+                        help="Phase 28: scale CBM input tokens by w = M_t * M_frame "
+                             "(max-normalised) so the explanation maps are "
+                             "load-bearing for the prediction (default True).")
+    parser.add_argument("--no_cbm_coupled", dest="cbm_coupled",
+                        action="store_false",
+                        help="Phase 28: disable coupling (Phase 27 raw-Q CBM input; "
+                             "ablation switch).")
     # ── Phase 27: DANN flags ────────────────────────────────────────────
     parser.add_argument("--dann_enabled", dest="dann_enabled",
                         action="store_true", default=None,

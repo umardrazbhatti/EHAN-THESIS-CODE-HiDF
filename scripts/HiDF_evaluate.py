@@ -533,14 +533,14 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         grad_7_avg.reshape(subset_size, -1),
     )
 
-    # ── Deletion / Insertion AUC (up to 5 heatmap samples) ─────────────────────
-    # Uses 5 clips for statistical reliability vs. 1-clip original.
-    # Root cause of historic 0.0 values: _gauss_blur used .expand() (non-contiguous)
-    # which F.conv2d (grouped) rejects on some PyTorch versions → now fixed with
-    # .contiguous() in metrics/HiDF_explanation.py.
+    # ── Deletion / Insertion AUC (Phase 28: 20 clips, 20 steps, chunked) ───────
+    # Phase ≤27 capped at 5 clips because the metric forwarded ALL clips in one
+    # batch (T4 OOM above ~5).  The metric now chunks its forwards (chunk=4),
+    # so the whole heatmap subset is affordable.  steps 10 → 20 for smoother
+    # curves; random-saliency control + fake-only aggregates added (Phase 28).
     import traceback as _traceback
     del_ins = {"deletion_auc": 0.0, "insertion_auc": 0.0}
-    _n_del_ins = min(subset_size, 5)   # 5 clips: reliable AUC, GPU-friendly
+    _n_del_ins = min(subset_size, 20)
     try:
         _di_frames_list = [test_ds[int(indices[i])]["frames"]
                            for i in range(_n_del_ins)]          # each (T,C,H,W)
@@ -548,8 +548,12 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         _sal_indices    = [int(indices[i]) for i in range(_n_del_ins)]
         _sal_stack      = all_M_t_up[_sal_indices]              # (N,T,H,W) GPU tensor
         _sal_np         = _sal_stack.detach().cpu().numpy()
+        _di_labels      = np.asarray(
+            [int(test_ds[int(indices[i])]["label"]) for i in range(_n_del_ins)]
+        )
         del_ins = ExplanationMetrics.deletion_insertion_auc(
-            model, _frames_stack, _sal_np, steps=10, n_samples=_n_del_ins
+            model, _frames_stack, _sal_np, steps=20, n_samples=_n_del_ins,
+            labels=_di_labels, chunk=4, random_control=True,
         )
     except Exception as e:
         print(f"  [Deletion/Insertion AUC error: {e}]")
@@ -595,14 +599,16 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         frame_drop_results = ExplanationMetrics.frame_attention_drop_test(
             model, test_loader, device, k_values=(1, 2, 4), seed=42
         )
-        print("[FrameDropTest] Results (top-K vs random-K drop):")
+        print("[FrameDropTest] Results (top-K vs random-K drop; "
+              "primary=replicate fill, legacy=zerofill):")
         for _k in (1, 2, 4):
             _td = frame_drop_results.get(f"k{_k}_top_conf_drop",    0.0)
             _rd = frame_drop_results.get(f"k{_k}_random_conf_drop", 0.0)
             _rt = frame_drop_results.get(f"k{_k}_ratio",            0.0)
+            _rtz = frame_drop_results.get(f"k{_k}_ratio_zerofill",  0.0)
             _tag = "✓" if _rt > 1.5 else ("~" if _rt > 1.0 else "✗")
             print(f"  k={_k}: top_drop={_td:+.4f}  random_drop={_rd:+.4f}  "
-                  f"ratio={_rt:.2f}x  {_tag}")
+                  f"ratio={_rt:.2f}x  {_tag}  (zerofill ratio={_rtz:.2f}x)")
         _k1_ratio = frame_drop_results.get("k1_ratio", 0.0)
         if _k1_ratio > 1.5:
             print("  [FrameDropTest] ✓ Attention maps target discriminative frames.")
@@ -624,6 +630,14 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         "del_at_50pct":  del_ins.get("del_at_50pct",  0.0),
         "ins_at_10pct":  del_ins.get("ins_at_10pct",  0.0),
         "ins_at_50pct":  del_ins.get("ins_at_50pct",  0.0),
+        # Phase 28: random-saliency control + fake-only aggregates.  The gains
+        # are the artifact-robust headline numbers (see metrics module doc).
+        "deletion_auc_random":      del_ins.get("deletion_auc_random",      0.0),
+        "insertion_auc_random":     del_ins.get("insertion_auc_random",     0.0),
+        "ins_gain_over_random":     del_ins.get("ins_gain_over_random",     0.0),
+        "del_gain_over_random":     del_ins.get("del_gain_over_random",     0.0),
+        "deletion_auc_fake_only":   del_ins.get("deletion_auc_fake_only",   0.0),
+        "insertion_auc_fake_only":  del_ins.get("insertion_auc_fake_only",  0.0),
     }
     exp_metrics = {
         "temporal_ssim":     ssim_val,

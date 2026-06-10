@@ -252,6 +252,8 @@ def main(config: EAHNConfig):
         "train_cbm_main_aux":  [],                      # Phase 27: main_logit aux supervision
         "train_domain":        [],                      # Phase 27: DANN domain CE loss
         "train_domain_acc":    [],                      # Phase 27: DANN domain top-1 accuracy
+        "train_eff_tokens":    [],                      # Phase 28: effective token count of
+                                                        # w = M_t ⊙ M_frame (coupling width)
         "train_peak_spread":   [],                      # v2: new term
         "train_sharp":         [],                      # v3: sharpness loss
         "val_auc_roc":         [], "val_balanced_acc":      [],
@@ -322,6 +324,7 @@ def main(config: EAHNConfig):
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "cbm_main_aux": 0.0,                          # Phase 27
             "domain": 0.0, "domain_acc": 0.0,             # Phase 27
+            "eff_tokens": 0.0,                            # Phase 28
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
@@ -333,6 +336,7 @@ def main(config: EAHNConfig):
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "cbm_main_aux": 0.0,                          # Phase 27
             "domain": 0.0, "domain_acc": 0.0,             # Phase 27
+            "eff_tokens": 0.0,                            # Phase 28
             "sparse": 0.0, "peak_spread": 0.0,
             "sharp": 0.0, "n": 0,
         }
@@ -609,6 +613,25 @@ def main(config: EAHNConfig):
                       f"domain_acc={_dom_acc:.4f}  "
                       f"lam_grl_eff={lam_grl_eff:.4f}  "
                       f"lam_dom_eff={lam_dom_eff:.4f}")
+                # Phase 28: CBM-attention coupling diagnostic.  w = M_t ⊙ M_frame
+                # (max-normalised) scales the CBM input tokens; eff_tokens =
+                # 1/Σ(ŵ²) on the sum-normalised weights ≈ how many of the T*N
+                # tokens the prediction can effectively see.  If this collapses
+                # to ~1 the bottleneck is too brutal; if it stays ≈ T*N the
+                # coupling is not biting.
+                _coupled = bool(getattr(out_A, "cbm_coupled", False))
+                with torch.no_grad():
+                    _Bd, _Td = out_A.M_frame.shape
+                    _w_diag = (out_A.M_t.reshape(_Bd, _Td, -1)
+                               * out_A.M_frame.unsqueeze(-1)).reshape(_Bd, -1)
+                    _w_sum  = _w_diag / _w_diag.sum(dim=1, keepdim=True).clamp(min=1e-12)
+                    _eff_tokens = float((1.0 / (_w_sum.pow(2).sum(dim=1)
+                                                .clamp(min=1e-12))).mean().item())
+                    _w_peak = float(_w_diag.amax(dim=1).mean().item())
+                print(f"[DIAG-P28] cbm_coupled={_coupled}  "
+                      f"w_peak={_w_peak:.4f}  "
+                      f"eff_tokens={_eff_tokens:.1f}/{_w_diag.shape[1]}  "
+                      f"M_frame_peak={float(out_A.M_frame.amax(dim=-1).mean().item()):.4f}")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -633,6 +656,18 @@ def main(config: EAHNConfig):
             _ls  = loss_sparse.item()
             _lps = l_peak_spread.item()
             _lsh = loss_sharp.item()
+            # Phase 28: effective token count of the coupling weight
+            # w = M_t ⊙ M_frame (1/Herfindahl of the sum-normalised weights).
+            # ≈ how many of the T*N tokens the CBM prediction can effectively
+            # see.  Collapse toward ~1 = bottleneck too brutal; staying ≈ T*N
+            # = maps near-uniform and coupling not biting.
+            with torch.no_grad():
+                _Bw, _Tw = out_A.M_frame.shape
+                _w_r = (out_A.M_t.reshape(_Bw, _Tw, -1)
+                        * out_A.M_frame.unsqueeze(-1)).reshape(_Bw, -1)
+                _w_r = _w_r / _w_r.sum(dim=1, keepdim=True).clamp(min=1e-12)
+                _eft = float((1.0 / _w_r.pow(2).sum(dim=1)
+                              .clamp(min=1e-12)).mean().item())
 
             run["total"]       += _lt;  run["cls"]    += _lc
             run["exp"]         += _le;  run["temp"]   += _lp
@@ -644,6 +679,7 @@ def main(config: EAHNConfig):
             run["cbm_main_aux"] += _lcm                           # Phase 27
             run["domain"]      += _ldm                            # Phase 27
             run["domain_acc"]  += _da                             # Phase 27
+            run["eff_tokens"]  += _eft                            # Phase 28
             run["sparse"]      += _ls
             run["peak_spread"] += _lps; run["sharp"]  += _lsh; run["n"] += 1
 
@@ -656,6 +692,7 @@ def main(config: EAHNConfig):
             epoch_acc["cbm_main_aux"] += _lcm                               # Phase 27
             epoch_acc["domain"]      += _ldm                                # Phase 27
             epoch_acc["domain_acc"]  += _da                                 # Phase 27
+            epoch_acc["eff_tokens"]  += _eft                                # Phase 28
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -682,6 +719,7 @@ def main(config: EAHNConfig):
                     f"cbm_main={run['cbm_main_aux']/n:.4f}  "              # Phase 27
                     f"domain={run['domain']/n:.4f}  "                      # Phase 27
                     f"dom_acc={run['domain_acc']/n:.3f}  "                 # Phase 27
+                    f"eff_tok={run['eff_tokens']/n:.0f}  "                 # Phase 28
                     f"sparse={run['sparse']/n:.4f}  "
                     f"sharp={run['sharp']/n:.4f}  "
                     f"peak_spread={run['peak_spread']/n:.4f}  "
@@ -697,6 +735,7 @@ def main(config: EAHNConfig):
                     "cbm_aux": 0.0, "cbm_div": 0.0,                        # Phase 26
                     "cbm_main_aux": 0.0,                                   # Phase 27
                     "domain": 0.0, "domain_acc": 0.0,                      # Phase 27
+                    "eff_tokens": 0.0,                                     # Phase 28
                     "sparse": 0.0,
                     "peak_spread": 0.0, "sharp": 0.0, "n": 0,
                 }
@@ -718,6 +757,7 @@ def main(config: EAHNConfig):
         history["train_cbm_main_aux"].append(epoch_acc["cbm_main_aux"] / n)  # Phase 27
         history["train_domain"].append(epoch_acc["domain"]     / n)   # Phase 27
         history["train_domain_acc"].append(epoch_acc["domain_acc"] / n)     # Phase 27
+        history["train_eff_tokens"].append(epoch_acc["eff_tokens"] / n)     # Phase 28
         history["train_sparse"].append(epoch_acc["sparse"]     / n)
         history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
         history["train_sharp"].append(epoch_acc["sharp"] / n)

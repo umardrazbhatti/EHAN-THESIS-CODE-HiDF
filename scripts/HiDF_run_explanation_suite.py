@@ -82,7 +82,9 @@ def run_explanation_suite(
     indices     = rng.choice(N, subset_size, replace=False)
 
     # ── Pre-sample del/ins indices ─────────────────────────────────────────────
-    N_DEL_INS = min(10, N)
+    # Phase 28: 10 → 50 clips (the Phase ≤27 headline numbers rested on 10
+    # clips — too noisy for publication).  Per-clip calls keep VRAM flat.
+    N_DEL_INS = min(50, N)
     rng_di    = np.random.default_rng(42)
     di_indices = rng_di.choice(N, size=N_DEL_INS, replace=False)
 
@@ -152,11 +154,13 @@ def run_explanation_suite(
     torch.cuda.empty_cache()
 
     # ── 5. Deletion / Insertion AUC (GPU-resident frames + saliency) ──────────
-    print("[ExplanationSuite] Computing deletion/insertion AUC...")
-    # Cap at 10 samples: each call runs ~10 forward passes on GPU.
+    print("[ExplanationSuite] Computing deletion/insertion AUC "
+          f"(N={N_DEL_INS}, steps=20, with random-saliency control)...")
     per_sample_del_ins = []
     _del_aucs = []
     _ins_aucs = []
+    _ins_gains = []       # Phase 28: gain of M_t ordering over random ordering
+    _del_gains = []
 
     for _si, _di in enumerate(di_indices):
         _di = int(_di)
@@ -166,12 +170,17 @@ def run_explanation_suite(
         _label_s = int(all_labels[_di]) if all_labels else -1
         _vpath_s = str(all_vid_paths[_di]) if all_vid_paths else ""
         _di_result = ExplanationMetrics.deletion_insertion_auc(
-            model, _f_s, _s_s, steps=10, n_samples=1
+            model, _f_s, _s_s, steps=20, n_samples=1,
+            random_control=True, verbose=False,
         )
         _d_auc = float(_di_result.get("deletion_auc", 0.0))
         _i_auc = float(_di_result.get("insertion_auc", 0.0))
+        _i_gain = float(_di_result.get("ins_gain_over_random", 0.0))
+        _d_gain = float(_di_result.get("del_gain_over_random", 0.0))
         _del_aucs.append(_d_auc)
         _ins_aucs.append(_i_auc)
+        _ins_gains.append(_i_gain)
+        _del_gains.append(_d_gain)
         _mt_std_s   = float(all_M_t_up_gpu[_di].std().item())
         _faith_s    = _i_auc - _d_auc
         per_sample_del_ins.append({
@@ -180,20 +189,27 @@ def run_explanation_suite(
             "prob":             _prob_s,
             "deletion_auc":     _d_auc,
             "insertion_auc":    _i_auc,
+            "ins_gain_over_random": _i_gain,
+            "del_gain_over_random": _d_gain,
             "m_t_std":          _mt_std_s,
             "faithfulness_score": _faith_s,
         })
         print(f"  [del/ins AUC sample {_si+1}/{N_DEL_INS}]  "
-              f"del={_d_auc:.4f}  ins={_i_auc:.4f}")
+              f"del={_d_auc:.4f}  ins={_i_auc:.4f}  "
+              f"ins_gain={_i_gain:+.4f}  del_gain={_d_gain:+.4f}")
         # Per-sample VRAM hygiene — del/ins clones full (T,C,H,W) per step
         torch.cuda.empty_cache()
 
     del_ins = {
         "deletion_auc":  float(np.mean(_del_aucs)) if _del_aucs else 0.0,
         "insertion_auc": float(np.mean(_ins_aucs)) if _ins_aucs else 0.0,
+        "ins_gain_over_random": float(np.mean(_ins_gains)) if _ins_gains else 0.0,
+        "del_gain_over_random": float(np.mean(_del_gains)) if _del_gains else 0.0,
     }
     print(f"  [del/ins AUC aggregate N={N_DEL_INS}]  "
-          f"del={del_ins['deletion_auc']:.4f}  ins={del_ins['insertion_auc']:.4f}")
+          f"del={del_ins['deletion_auc']:.4f}  ins={del_ins['insertion_auc']:.4f}  "
+          f"ins_gain_over_random={del_ins['ins_gain_over_random']:+.4f}  "
+          f"del_gain_over_random={del_ins['del_gain_over_random']:+.4f}")
 
     _per_sample_path = Path("outputs") / "explanation_per_sample.json"
     _per_sample_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,11 +261,23 @@ def run_explanation_suite(
         print(f"  [stability_check skipped: {e}]")
 
     # ── Assemble result ───────────────────────────────────────────────────────
+    # Phase 28: fake-only del/ins aggregates from the per-sample records
+    # (artifact localisation is only well-defined on manipulated samples).
+    _fake_rows = [r for r in per_sample_del_ins if r.get("label", -1) == 1]
+    _del_fake = (float(np.mean([r["deletion_auc"]  for r in _fake_rows]))
+                 if _fake_rows else 0.0)
+    _ins_fake = (float(np.mean([r["insertion_auc"] for r in _fake_rows]))
+                 if _fake_rows else 0.0)
+
     result = {
         "active_manipulation": getattr(config, "active_manipulation", ""),
         "intrinsic": {
             "deletion_auc":              del_ins.get("deletion_auc", 0.0),
             "insertion_auc":             del_ins.get("insertion_auc", 0.0),
+            "ins_gain_over_random":      del_ins.get("ins_gain_over_random", 0.0),
+            "del_gain_over_random":      del_ins.get("del_gain_over_random", 0.0),
+            "deletion_auc_fake_only":    _del_fake,
+            "insertion_auc_fake_only":   _ins_fake,
             "temporal_ssim":             float(ssim_val),
             "faithfulness_corr":         float(faithful_corr),
             "inter_sample_cos_mean":     float(collapse_diag.get("inter_sample_cosine_mean", 0.0)),
@@ -267,6 +295,10 @@ def run_explanation_suite(
     print(f"  Faithfulness corr        : {result['intrinsic']['faithfulness_corr']:.3f}")
     print(f"  Deletion AUC             : {result['intrinsic']['deletion_auc']:.3f}")
     print(f"  Insertion AUC            : {result['intrinsic']['insertion_auc']:.3f}")
+    print(f"  Ins gain over random     : {result['intrinsic']['ins_gain_over_random']:+.4f}")
+    print(f"  Del gain over random     : {result['intrinsic']['del_gain_over_random']:+.4f}")
+    print(f"  Del/Ins AUC (fake only)  : {result['intrinsic']['deletion_auc_fake_only']:.3f} / "
+          f"{result['intrinsic']['insertion_auc_fake_only']:.3f}")
     print(f"  Inter-sample cosine      : {result['intrinsic']['inter_sample_cos_mean']:.3f}")
     print(f"  Peak mode share          : {result['intrinsic']['peak_mode_share']:.3f}")
     print(f"  M_t std mean             : {result['intrinsic']['m_t_std_mean']:.4f}")
@@ -275,7 +307,8 @@ def run_explanation_suite(
         if f"k{k}_ratio" in drop_results:
             print(f"  Drop ratio K={k}           : {drop_results[f'k{k}_ratio']:.3f} "
                   f"(top={drop_results[f'k{k}_top_conf_drop']:.3f} "
-                  f"rand={drop_results[f'k{k}_random_conf_drop']:.3f})")
+                  f"rand={drop_results[f'k{k}_random_conf_drop']:.3f}; "
+                  f"zerofill={drop_results.get(f'k{k}_ratio_zerofill', 0.0):.3f})")
     if stability:
         print(f"  Stability cosine (mean)  : {stability.get('stability_cosine_mean', 0):.4f}")
 

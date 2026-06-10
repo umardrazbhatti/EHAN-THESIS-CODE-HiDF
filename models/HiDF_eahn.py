@@ -72,6 +72,10 @@ class EAHNOutput:
     #                                     (no parallel-blend escape hatch).
     domain_logits:   torch.Tensor = None
     cbm_serial:      bool = False
+    # ── Phase 28: True when CBM input tokens are scaled by M_t ⊙ M_frame ─────
+    # (the coupling that makes the explanation maps load-bearing for the
+    # prediction; False = Phase 27 raw-Q behaviour).
+    cbm_coupled:     bool = False
 
 
 class EarlyAttnHead(nn.Module):
@@ -218,6 +222,21 @@ class EAHN(nn.Module):
         # parallel-blend behaviour for ablation.
         self.cbm_serial = bool(getattr(config, "cbm_serial", True))
 
+        # ── Phase 28: CBM-attention coupling ──────────────────────────────────
+        # Phase 27 post-mortem: serial CBM read RAW transformer tokens Q_flat,
+        # bypassing both the M_t-weighted spatial pooling and the M_frame
+        # temporal gate.  Result: detection 0.914 (best ever) but k1 ratio
+        # exactly 1.000 and faith_corr 0.071 — the run log proved M_frame was
+        # near one-hot (99.998% on one frame) yet dropping that frame moved the
+        # prediction no more than dropping a random frame.  The maps were
+        # decoration.
+        # Fix: scale each token fed to the CBM by its joint spatio-temporal
+        # attention mass w = M_t[b,t,n] * M_frame[b,t], max-normalised per
+        # sample.  A token the maps ignore now contributes ~nothing to the
+        # prediction, so classification loss directly punishes dishonest maps.
+        # Set --no_cbm_coupled to revert to Phase 27 raw-Q behaviour (ablation).
+        self.cbm_coupled = bool(getattr(config, "cbm_coupled", True))
+
         # ── Phase 27: DANN domain classifier ──────────────────────────────────
         # GRL(attn_pool) -> DomainHead -> (B, D) logits.  In training the
         # batch carries a per-sample `domain` label in [0, D-1] (random
@@ -331,7 +350,20 @@ class EAHN(nn.Module):
         # prediction path -- this removes the Phase 26 escape hatch.
         if self.cbm is not None:
             Q_flat = Q.reshape(B, T * N, d)
-            cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(Q_flat)
+            # ── Phase 28: couple CBM input to the explanation maps ────────────
+            # w[b, t*N+n] = M_t_use[b,t,n] * M_frame[b,t]  (joint mass over the
+            # T*N grid; sums to 1 per sample since both factors are softmaxes).
+            # Max-normalise so the top token keeps full magnitude (mean-norm
+            # would blow token scale up ~T*N-fold for peaky maps → fp16 risk).
+            # Gradient w.r.t. M_frame/M_t stays alive even where w underflows
+            # to 0 because slot_pool is linear in w.
+            if self.cbm_coupled:
+                w = (M_flat * M_frame.unsqueeze(-1)).reshape(B, T * N, 1)
+                w = w / w.amax(dim=1, keepdim=True).clamp(min=1e-6)
+                Q_cbm = Q_flat * w
+            else:
+                Q_cbm = Q_flat
+            cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(Q_cbm)
             if self.cbm_serial:
                 # Phase 27: pure serial bottleneck — cbm_logit is the sole
                 # prediction.  main_logit is only used by the aux loss.
@@ -375,4 +407,5 @@ class EAHN(nn.Module):
             cbm_blend=cbm_blend,
             domain_logits=domain_logits,
             cbm_serial=self.cbm_serial,
+            cbm_coupled=(self.cbm_coupled and self.cbm is not None),
         )

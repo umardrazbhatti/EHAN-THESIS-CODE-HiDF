@@ -50,29 +50,55 @@ class ExplanationMetrics:
     @staticmethod
     def deletion_insertion_auc(model, frames, saliency,
                                steps: int = 10,
-                               n_samples: int = 100) -> dict:
+                               n_samples: int = 100,
+                               labels=None,
+                               chunk: int = 4,
+                               random_control: bool = True,
+                               seed: int = 123,
+                               verbose: bool = True) -> dict:
         """
-        Deletion/Insertion AUC: simplified implementation.
-        Steps are coarse for speed; increase for publication-quality numbers.
+        Deletion/Insertion AUC with random-saliency control (Phase 28).
 
-        n_samples: maximum number of video clips to process (default 100).
+        n_samples      : maximum number of video clips to process.
+        labels         : optional (B,) array of class labels; when provided,
+                         fake-only aggregates are added (*_fake_only keys).
+        chunk          : forward-pass micro-batch — allows n_samples >> 5
+                         without OOM (Phase ≤27 forwarded all clips at once).
+        random_control : also run the identical procedure with a per-sample
+                         RANDOM pixel ranking and report the gain of the real
+                         saliency over it.  Phase 27 evidence made this
+                         mandatory: the model scores a fully-blurred clip at
+                         0.82 fake vs 0.47 baseline, so the absolute del/ins
+                         curves are dominated by the blur-direction artifact
+                         and deletion > insertion is guaranteed REGARDLESS of
+                         map quality.  The random control cancels the
+                         artifact: it affects both orderings equally, so the
+                         difference isolates the ordering quality of the map.
 
         Returns
         -------
         dict with keys:
-          deletion_auc, insertion_auc  — AUC of confidence-vs-fraction curves
-          del_at_{0,10,25,50,100}pct   — deletion confidence at those removal levels
-          ins_at_{0,10,25,50,100}pct   — insertion confidence at those reveal levels
-          faithfulness_ok              — True when insertion_auc > deletion_auc
-        A faithful heatmap has insertion_auc > deletion_auc (high insertion = salient
-        regions restore confidence; low deletion = removing them destroys it).
+          deletion_auc, insertion_auc      — AUC of confidence-vs-fraction curves
+          del_at_{0,10,25,50,100}pct       — deletion confidence at those levels
+          ins_at_{0,10,25,50,100}pct       — insertion confidence at those levels
+          faithfulness_ok                  — True when insertion_auc > deletion_auc
+          deletion_auc_random, insertion_auc_random   (when random_control)
+          ins_gain_over_random             — insertion_auc - insertion_auc_random
+                                             (> 0 ⇒ map beats random ordering)
+          del_gain_over_random             — deletion_auc_random - deletion_auc
+                                             (> 0 ⇒ map beats random ordering)
+          deletion_auc_fake_only, insertion_auc_fake_only  (when labels given)
         """
-        print(f"[del_ins] Running on {n_samples} samples, steps={steps}")
         device = next(model.parameters()).device
         B_full, T, C, H, W = frames.shape
         B = min(n_samples, B_full)
+        if verbose:
+            print(f"[del_ins] Running on {B} samples, steps={steps}, "
+                  f"chunk={chunk}, random_control={random_control}")
         frames   = frames[:B]
-        saliency = saliency[:B]
+        saliency = np.asarray(saliency)[:B]
+        if labels is not None:
+            labels = np.asarray(labels)[:B]
         total_pixels  = H * W
 
         import torch.nn.functional as _F
@@ -98,16 +124,26 @@ class ExplanationMetrics:
             blurred = _F.conv2d(blurred, ky, padding=(pad, 0), groups=Cx)
             return blurred.reshape(Bx, Tx, Cx, Hx, Wx)
 
+        def _fwd_probs(x):
+            """Chunked no-grad forward → (B,) numpy of fake-probs."""
+            outs = []
+            with torch.no_grad():
+                for i in range(0, x.shape[0], chunk):
+                    outs.append(model(x[i:i+chunk].to(device)).prob.detach().cpu())
+            return torch.cat(outs).numpy()
+
         with torch.no_grad():
-            baseline_conf = model(frames.to(device)).prob.mean().item()
-            blurred_full  = _gauss_blur(frames)            # (B, T, C, H, W)
-            blurred_conf  = model(blurred_full.to(device)).prob.mean().item()
+            baseline_probs = _fwd_probs(frames)
+            blurred_full   = _gauss_blur(frames)            # (B, T, C, H, W)
+            blurred_probs  = _fwd_probs(blurred_full)
+        baseline_conf = float(baseline_probs.mean())
+        blurred_conf  = float(blurred_probs.mean())
 
-        del_scores = []
-        ins_scores = []
-
-        # Use mean explanation over time
-        sal = saliency.mean(1)   # (B, H, W)
+        # Use mean explanation over time; per-sample descending pixel ranking
+        sal       = saliency.mean(1).reshape(B, -1)             # (B, H*W)
+        order_sal = np.argsort(sal, axis=1)[:, ::-1]            # (B, H*W) desc
+        _rng       = np.random.default_rng(seed)
+        order_rand = np.stack([_rng.permutation(total_pixels) for _ in range(B)])
 
         # Checkpoint steps for per-percentage reporting (0%, 10%, 25%, 50%, 100%)
         _pct_to_step = {
@@ -118,31 +154,34 @@ class ExplanationMetrics:
             100: steps,
         }
 
-        for step in range(steps + 1):
-            frac = step / steps
-            k    = max(1, int(frac * total_pixels))
+        def _curves(order):
+            """Run the del/ins sweep for a given (B, H*W) pixel ordering.
+            Returns (steps+1, B) per-sample prob matrices."""
+            del_mat = np.zeros((steps + 1, B), dtype=np.float64)
+            ins_mat = np.zeros((steps + 1, B), dtype=np.float64)
+            for step in range(steps + 1):
+                frac = step / steps
+                k    = max(1, int(frac * total_pixels))
 
-            # Deletion: replace top-k pixels with blurred version
-            # Insertion: start blurred, reveal top-k from original
-            del_frames = frames.clone()
-            ins_frames = blurred_full.clone()
+                # Deletion: replace top-k pixels with blurred version
+                # Insertion: start blurred, reveal top-k from original
+                del_frames = frames.clone()
+                ins_frames = blurred_full.clone()
 
-            for b in range(B):
-                flat_sal = sal[b].reshape(-1)
-                top_k_idx = np.argsort(flat_sal)[-k:].copy()
-                mask = np.zeros(H * W, dtype=bool)
-                mask[top_k_idx] = True
-                mask_2d = mask.reshape(H, W)
+                for b in range(B):
+                    top_k_idx = order[b, :k].copy()
+                    mask = np.zeros(total_pixels, dtype=bool)
+                    mask[top_k_idx] = True
+                    mask_2d = mask.reshape(H, W)
 
-                del_frames[b, :, :, mask_2d] = blurred_full[b, :, :, mask_2d]
-                ins_frames[b, :, :, mask_2d] = frames[b, :, :, mask_2d]
+                    del_frames[b, :, :, mask_2d] = blurred_full[b, :, :, mask_2d]
+                    ins_frames[b, :, :, mask_2d] = frames[b, :, :, mask_2d]
 
-            with torch.no_grad():
-                del_score = model(del_frames.to(device)).prob.mean().item()
-                ins_score = model(ins_frames.to(device)).prob.mean().item()
+                del_mat[step] = _fwd_probs(del_frames)
+                ins_mat[step] = _fwd_probs(ins_frames)
+            return del_mat, ins_mat
 
-            del_scores.append(del_score)
-            ins_scores.append(ins_score)
+        del_mat, ins_mat = _curves(order_sal)
 
         # NumPy 2.x removed np.trapz (renamed to np.trapezoid).
         # getattr(np, "trapezoid", np.trapz) looks safe but Python evaluates
@@ -153,8 +192,13 @@ class ExplanationMetrics:
             _trapz = np.trapezoid   # NumPy ≥ 2.0
         except AttributeError:
             _trapz = np.trapz       # NumPy < 2.0
-        del_auc = float(_trapz(del_scores) / steps)
-        ins_auc = float(_trapz(ins_scores) / steps)
+
+        del_auc_per = _trapz(del_mat, axis=0) / steps           # (B,)
+        ins_auc_per = _trapz(ins_mat, axis=0) / steps           # (B,)
+        del_auc = float(del_auc_per.mean())
+        ins_auc = float(ins_auc_per.mean())
+        del_scores = del_mat.mean(axis=1)                        # mean curve for table
+        ins_scores = ins_mat.mean(axis=1)
 
         # Assemble result dict — scalar values for CSV; per-checkpoint for reporting
         result = {
@@ -167,27 +211,50 @@ class ExplanationMetrics:
                 result[f"del_at_{pct}pct"] = float(del_scores[sidx])
                 result[f"ins_at_{pct}pct"] = float(ins_scores[sidx])
 
+        # ── Phase 28: random-saliency control ─────────────────────────────────
+        if random_control:
+            del_mat_r, ins_mat_r = _curves(order_rand)
+            del_auc_r = float((_trapz(del_mat_r, axis=0) / steps).mean())
+            ins_auc_r = float((_trapz(ins_mat_r, axis=0) / steps).mean())
+            result["deletion_auc_random"]   = del_auc_r
+            result["insertion_auc_random"]  = ins_auc_r
+            result["ins_gain_over_random"]  = ins_auc - ins_auc_r
+            result["del_gain_over_random"]  = del_auc_r - del_auc
+
+        # ── Phase 28: fake-only aggregates (artifact localisation is only
+        # well-defined on manipulated samples) ────────────────────────────────
+        if labels is not None and (labels == 1).any():
+            _fk = labels == 1
+            result["deletion_auc_fake_only"]  = float(del_auc_per[_fk].mean())
+            result["insertion_auc_fake_only"] = float(ins_auc_per[_fk].mean())
+
         # ── Print formatted curve table ──────────────────────────────────────
-        print(f"\n  [Del/Ins] baseline_conf={baseline_conf:.4f}  "
-              f"blurred_conf={blurred_conf:.4f}  n_clips={B}  steps={steps}")
-        print(f"  {'%removed':>8}  {'del_conf':>9}  {'ins_conf':>9}  "
-              f"{'del_drop':>10}  {'ins_gain':>10}")
-        for pct in [0, 10, 25, 50, 100]:
-            dk = f"del_at_{pct}pct"
-            ik = f"ins_at_{pct}pct"
-            if dk in result and ik in result:
-                drop = baseline_conf - result[dk]
-                gain = result[ik] - blurred_conf
-                print(f"  {pct:>7}%  {result[dk]:>9.4f}  {result[ik]:>9.4f}  "
-                      f"{drop:>+10.4f}  {gain:>+10.4f}")
-        faithful_tag = "✓ faithful" if ins_auc > del_auc else "✗ NOT faithful"
-        print(f"  AUC → deletion={del_auc:.4f}  insertion={ins_auc:.4f}  [{faithful_tag}]")
-        if ins_auc > del_auc:
-            print("  Removing salient regions drops confidence MORE than random — "
-                  "heatmap IS predictive.")
-        else:
-            print("  WARNING: insertion_auc <= deletion_auc — heatmap NOT more "
-                  "predictive than random. Check M_t gradient flow.")
+        if verbose:
+            print(f"\n  [Del/Ins] baseline_conf={baseline_conf:.4f}  "
+                  f"blurred_conf={blurred_conf:.4f}  n_clips={B}  steps={steps}")
+            print(f"  {'%removed':>8}  {'del_conf':>9}  {'ins_conf':>9}  "
+                  f"{'del_drop':>10}  {'ins_gain':>10}")
+            for pct in [0, 10, 25, 50, 100]:
+                dk = f"del_at_{pct}pct"
+                ik = f"ins_at_{pct}pct"
+                if dk in result and ik in result:
+                    drop = baseline_conf - result[dk]
+                    gain = result[ik] - blurred_conf
+                    print(f"  {pct:>7}%  {result[dk]:>9.4f}  {result[ik]:>9.4f}  "
+                          f"{drop:>+10.4f}  {gain:>+10.4f}")
+            faithful_tag = "✓ faithful" if ins_auc > del_auc else "✗ NOT faithful"
+            print(f"  AUC → deletion={del_auc:.4f}  insertion={ins_auc:.4f}  [{faithful_tag}]")
+            if random_control:
+                _ig = result["ins_gain_over_random"]
+                _dg = result["del_gain_over_random"]
+                _ctl_tag = ("✓ beats random" if (_ig > 0 and _dg > 0)
+                            else "✗ does NOT beat random")
+                print(f"  Random control → del_rand={del_auc_r:.4f}  "
+                      f"ins_rand={ins_auc_r:.4f}  "
+                      f"ins_gain={_ig:+.4f}  del_gain={_dg:+.4f}  [{_ctl_tag}]")
+                print("  (gains cancel the blur-direction artifact: a map with "
+                      "real ordering information shows BOTH gains > 0 even when "
+                      "the absolute curves are inverted by the artifact)")
 
         return result
 
@@ -242,6 +309,30 @@ class ExplanationMetrics:
         }
 
     @staticmethod
+    def _mask_frames(clip: torch.Tensor, drop_idx, mode: str) -> torch.Tensor:
+        """Remove frames at drop_idx from clip (1, T, C, H, W), in place.
+
+        mode="replicate" (Phase 28 primary): each dropped frame is replaced by
+            its nearest non-dropped neighbour (freeze-frame).  Stays
+            in-distribution — removes the dropped frame's unique evidence
+            without injecting an out-of-distribution artifact.
+        mode="zero" (legacy, Phase ≤27): frames set to 0 in normalised space
+            (≈ ImageNet-mean gray).  Phase 27 measured a +0.37 fake-prob shift
+            for ANY masked frame — the gray-frame artifact swamped the
+            top-vs-random differential and pinned all k-ratios at 1.000.
+        """
+        T = clip.shape[1]
+        drop_set = {int(i) for i in drop_idx}
+        if mode == "zero" or len(drop_set) >= T:
+            clip[0, list(drop_set)] = 0.0
+            return clip
+        keep = np.asarray([t for t in range(T) if t not in drop_set])
+        for t in drop_set:
+            nearest = int(keep[np.argmin(np.abs(keep - t))])
+            clip[0, t] = clip[0, nearest]
+        return clip
+
+    @staticmethod
     def frame_attention_drop_test(
         model, loader, device, k_values=(1, 2, 4), seed: int = 42
     ) -> dict:
@@ -249,16 +340,23 @@ class ExplanationMetrics:
         Intrinsic faithfulness test.
 
         For each video in the loader:
-        1. Forward pass (eval, no_grad) → get M_t (B, T, h, w).
-        2. Per-frame attention score = M_t[b, t, :, :].mean() over (h, w).
-        3. Rank frames by score (descending).
-        4. For each K in k_values:
-           a. Zero out top-K frames (at normalised input level) → re-forward → record prob.
-           b. Zero out K random frames (seeded) → re-forward → record prob.
-        5. Aggregate: conf_drop = original_prob - masked_prob.
+        1. Forward pass (eval, no_grad) → get M_frame (B, T) from temporal_gate.
+        2. Rank frames by attention score (descending).
+        3. For each K in k_values, and for each fill protocol:
+           a. Drop top-K frames → re-forward → record prob.
+           b. Drop K random frames (seeded, same indices for both fills)
+              → re-forward → record prob.
+        4. Aggregate: conf_drop = original_prob - masked_prob.
 
-        Returns dict with keys:
-            k{K}_top_conf_drop, k{K}_random_conf_drop, k{K}_ratio  for each K.
+        Phase 28 protocol change: the PRIMARY fill is nearest-frame
+        replication (freeze-frame, in-distribution).  The legacy zero-fill
+        numbers are still computed in the same pass and reported under
+        *_zerofill keys for cross-phase comparability.
+
+        Returns dict with keys (per K):
+            k{K}_top_conf_drop, k{K}_random_conf_drop, k{K}_ratio          (replicate fill)
+            k{K}_top_conf_drop_zerofill, k{K}_random_conf_drop_zerofill,
+            k{K}_ratio_zerofill                                            (legacy fill)
         A faithful explanation shows top_conf_drop >> random_conf_drop.
         """
         import numpy as np
@@ -266,7 +364,8 @@ class ExplanationMetrics:
         model.eval()
         rng = np.random.default_rng(seed)
 
-        accum = {k: {"top": [], "rand": []} for k in k_values}
+        _fills = ("replicate", "zero")
+        accum = {(k, f): {"top": [], "rand": []} for k in k_values for f in _fills}
 
         _debug_printed = False   # print diagnostics once for the first batch
 
@@ -287,6 +386,8 @@ class ExplanationMetrics:
 
                 # Task 1.3 diagnostic: dump raw M_t statistics once (first batch only)
                 if not _debug_printed:
+                    print(f"[DIAG frame_attn_drop] fill protocols: primary=replicate "
+                          f"(Phase 28, freeze-frame), secondary=zero (legacy *_zerofill keys)")
                     print(f"[DIAG frame_attn_drop] M_t shape: {M_t.shape}")
                     print(f"[DIAG frame_attn_drop] M_t mean per frame:\n"
                           f"  {M_t.mean(dim=(-1,-2))}")
@@ -317,32 +418,37 @@ class ExplanationMetrics:
 
                     for k in k_values:
                         k = min(k, T)
-
-                        # — Top-K drop —
-                        top_k_idx = ranked[:k]
-                        f_top     = frames[b:b+1].clone()      # (1, T, C, H, W)
-                        f_top[0, top_k_idx] = 0.0
-                        drop_top  = orig_prob - float(model(f_top.to(device)).prob.cpu())
-
-                        # — Random-K drop —
+                        top_k_idx  = ranked[:k]
+                        # Same random indices for both fill protocols so the
+                        # replicate-vs-zero comparison is apples-to-apples.
                         rand_k_idx = rng.choice(T, size=k, replace=False)
-                        f_rand     = frames[b:b+1].clone()
-                        f_rand[0, rand_k_idx] = 0.0
-                        drop_rand  = orig_prob - float(model(f_rand.to(device)).prob.cpu())
 
-                        accum[k]["top"].append(drop_top)
-                        accum[k]["rand"].append(drop_rand)
+                        for fill in _fills:
+                            f_top = ExplanationMetrics._mask_frames(
+                                frames[b:b+1].clone(), top_k_idx, fill)
+                            drop_top = orig_prob - float(
+                                model(f_top.to(device)).prob.cpu())
+
+                            f_rand = ExplanationMetrics._mask_frames(
+                                frames[b:b+1].clone(), rand_k_idx, fill)
+                            drop_rand = orig_prob - float(
+                                model(f_rand.to(device)).prob.cpu())
+
+                            accum[(k, fill)]["top"].append(drop_top)
+                            accum[(k, fill)]["rand"].append(drop_rand)
 
         result = {}
         for k in k_values:
-            tops   = accum[k]["top"]
-            rands  = accum[k]["rand"]
-            t_mean = float(np.mean(tops))  if tops  else 0.0
-            r_mean = float(np.mean(rands)) if rands else 0.0
-            ratio  = t_mean / (r_mean + 1e-8)
-            result[f"k{k}_top_conf_drop"]    = t_mean
-            result[f"k{k}_random_conf_drop"] = r_mean
-            result[f"k{k}_ratio"]            = ratio
+            for fill in _fills:
+                tops   = accum[(k, fill)]["top"]
+                rands  = accum[(k, fill)]["rand"]
+                t_mean = float(np.mean(tops))  if tops  else 0.0
+                r_mean = float(np.mean(rands)) if rands else 0.0
+                ratio  = t_mean / (r_mean + 1e-8)
+                _sfx = "" if fill == "replicate" else "_zerofill"
+                result[f"k{k}_top_conf_drop{_sfx}"]    = t_mean
+                result[f"k{k}_random_conf_drop{_sfx}"] = r_mean
+                result[f"k{k}_ratio{_sfx}"]            = ratio
         return result
 
     @staticmethod
