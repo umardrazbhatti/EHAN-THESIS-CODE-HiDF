@@ -125,13 +125,29 @@ class EAHNConfig:
     # serial bottleneck must carry the full prediction.
     cbm_enabled:           bool  = True
     cbm_serial:            bool  = True   # Phase 27: serial vs Phase 26 parallel
-    cbm_coupled:           bool  = True   # Phase 28: scale CBM input tokens by
-                                          # w = M_t ⊙ M_frame (max-normalised per
-                                          # sample) so the explanation maps are
-                                          # load-bearing for the prediction.
-                                          # Phase 27 evidence: serial CBM on RAW Q
-                                          # gave detection 0.914 but k1=1.000 and
-                                          # faith_corr=0.071 — maps were decoration.
+    cbm_coupled:           bool  = True   # Phase 28 (DEAD — kept for ablation
+                                          # history only): scale CBM input tokens
+                                          # by w = M_t ⊙ M_frame (max-normalised).
+                                          # Run 6-11-26 1300hrs: multiplicative
+                                          # scaling starved slot attention (782 of
+                                          # 784 keys ≈ 0 → softmax dilution →
+                                          # constant logit), cls froze at 0.1838
+                                          # from batch 1000 and val AUC never left
+                                          # ~0.5 for 9 epochs.  Superseded by
+                                          # cbm_pooled, which takes precedence.
+    cbm_pooled:            bool  = True   # Phase 29: CBM reads the M_t-pooled
+                                          # per-frame vectors attn_pool_per_frame
+                                          # (B, T, d) — a CONVEX combination, so
+                                          # magnitude is always preserved and M_t
+                                          # is structurally load-bearing (tokens
+                                          # it suppresses are absent, not small).
+                                          # M_frame couples as an attention PRIOR:
+                                          # log(M_frame) added to slot-attention
+                                          # logits (renormalised by softmax — no
+                                          # starvation possible).  P23 precedent:
+                                          # the same pooled path classified at
+                                          # 0.904 with k1 1.64 under the old
+                                          # artifact-diluted protocol.
     cbm_num_slots:         int   = 12     # Phase 27: K = 12 (was 8 in Phase 26)
     lambda_cbm_aux:        float = 0.10   # weight on CBM auxiliary classification loss
     lambda_cbm_div:        float = 0.05   # weight on slot diversity loss
@@ -372,6 +388,18 @@ def parse_args() -> argparse.Namespace:
                         action="store_false",
                         help="Phase 28: disable coupling (Phase 27 raw-Q CBM input; "
                              "ablation switch).")
+    # ── Phase 29: pooled-frame CBM input (supersedes cbm_coupled) ───────
+    parser.add_argument("--cbm_pooled", dest="cbm_pooled",
+                        action="store_true", default=None,
+                        help="Phase 29: CBM reads M_t-pooled per-frame vectors "
+                             "(B, T, d) with log(M_frame) as a slot-attention "
+                             "prior. Convex pooling — no magnitude starvation "
+                             "(the Phase 28 failure mode). Takes precedence "
+                             "over --cbm_coupled (default True).")
+    parser.add_argument("--no_cbm_pooled", dest="cbm_pooled",
+                        action="store_false",
+                        help="Phase 29: disable pooled CBM input (falls back to "
+                             "cbm_coupled / raw-Q behaviour; ablation switch).")
     # ── Phase 27: DANN flags ────────────────────────────────────────────
     parser.add_argument("--dann_enabled", dest="dann_enabled",
                         action="store_true", default=None,

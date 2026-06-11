@@ -74,8 +74,13 @@ class EAHNOutput:
     cbm_serial:      bool = False
     # ── Phase 28: True when CBM input tokens are scaled by M_t ⊙ M_frame ─────
     # (the coupling that makes the explanation maps load-bearing for the
-    # prediction; False = Phase 27 raw-Q behaviour).
+    # prediction; False = Phase 27 raw-Q behaviour).  Reports the EFFECTIVE
+    # state: False whenever cbm_pooled supersedes it.
     cbm_coupled:     bool = False
+    # ── Phase 29: True when the CBM reads attn_pool_per_frame (B, T, d) with
+    # log(M_frame) as slot-attention prior.  When True, slot_attn is (B, K, T)
+    # — slots attend over FRAMES, not (frame, position) pairs.
+    cbm_pooled:      bool = False
 
 
 class EarlyAttnHead(nn.Module):
@@ -237,6 +242,21 @@ class EAHN(nn.Module):
         # Set --no_cbm_coupled to revert to Phase 27 raw-Q behaviour (ablation).
         self.cbm_coupled = bool(getattr(config, "cbm_coupled", True))
 
+        # ── Phase 29: pooled-frame CBM input (supersedes cbm_coupled) ─────────
+        # Phase 28 post-mortem (run 6-11-26 1300hrs): multiplicative scaling of
+        # CBM input tokens by w = M_t ⊙ M_frame STARVED the slot attention —
+        # once the sparsity regularisers made the maps peaky, 782/784 keys were
+        # near-zero, the slot softmax diluted the survivors (~780 dead keys at
+        # e^0 each soak up the mass), slot_pool collapsed toward 0 and the
+        # logit froze at the fc bias.  cls loss sat at 0.1838 for 9 epochs and
+        # val AUC never left ~0.5.  Scaling magnitudes is NOT pooling.
+        # Fix: the CBM reads attn_pool_per_frame (B, T, d) — the M_t-pooled
+        # per-frame vectors (CONVEX combination — magnitude preserved no matter
+        # how peaky M_t gets), with M_frame applied inside the CBM as a
+        # log-space attention prior (renormalised by softmax — same guarantee).
+        # Takes precedence over cbm_coupled when True.
+        self.cbm_pooled = bool(getattr(config, "cbm_pooled", True))
+
         # ── Phase 27: DANN domain classifier ──────────────────────────────────
         # GRL(attn_pool) -> DomainHead -> (B, D) logits.  In training the
         # batch carries a per-sample `domain` label in [0, D-1] (random
@@ -339,31 +359,42 @@ class EAHN(nn.Module):
 
         main_logit = self.classifier(attn_pool).squeeze(-1)
 
-        # ── Phase 26+27: Concept Slot Bottleneck ──────────────────────────────
-        # The CBM reads transformer Q (B, T*N, d) — same features the standard
-        # classifier consumes after M_t-gated pooling, but BEFORE the temporal
-        # gate collapses time.  Slots can therefore attend to (frame, position)
-        # pairs and discover spatio-temporal concepts.
+        # ── Phase 26..29: Concept Slot Bottleneck ─────────────────────────────
+        # Input depends on mode (precedence: pooled > coupled > raw):
+        #   Phase 29 cbm_pooled : attn_pool_per_frame (B, T, d) + M_frame prior
+        #                         — both couplings renormalised, starvation-proof.
+        #   Phase 28 cbm_coupled: Q_flat scaled by w = M_t ⊙ M_frame (DEAD —
+        #                         magnitude starvation; ablation reference).
+        #   Phase 27 raw        : Q_flat (B, T*N, d) — maps were decoration.
         #
         # Phase 27 (serial): out.logit = cbm_logit only.  main_logit is exposed
         # for the auxiliary supervision loss (regulariser) but is NOT in the
         # prediction path -- this removes the Phase 26 escape hatch.
         if self.cbm is not None:
-            Q_flat = Q.reshape(B, T * N, d)
-            # ── Phase 28: couple CBM input to the explanation maps ────────────
-            # w[b, t*N+n] = M_t_use[b,t,n] * M_frame[b,t]  (joint mass over the
-            # T*N grid; sums to 1 per sample since both factors are softmaxes).
-            # Max-normalise so the top token keeps full magnitude (mean-norm
-            # would blow token scale up ~T*N-fold for peaky maps → fp16 risk).
-            # Gradient w.r.t. M_frame/M_t stays alive even where w underflows
-            # to 0 because slot_pool is linear in w.
-            if self.cbm_coupled:
+            if self.cbm_pooled:
+                # ── Phase 29: CBM reads the M_t-pooled per-frame path ─────────
+                # attn_pool_per_frame[b,t] = Σ_n M_t[b,t,n] · Q[b,t,n] — convex
+                # combination: full magnitude however peaky M_t gets, and tokens
+                # M_t suppresses are structurally ABSENT from the CBM input (the
+                # spatial coupling cannot be bypassed).  M_frame couples as a
+                # log-space prior on the slot attention inside the CBM
+                # (renormalised by the softmax — the temporal coupling cannot
+                # starve magnitudes either).  slot_attn shape: (B, K, T).
+                cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(
+                    attn_pool_per_frame, prior=M_frame)
+            elif self.cbm_coupled:
+                # ── Phase 28 (DEAD — ablation reference only): multiplicative
+                # token scaling.  Starved slot attention and froze the logit at
+                # the fc bias (run 6-11-26 1300hrs: val AUC ~0.5 for 9 epochs).
+                Q_flat = Q.reshape(B, T * N, d)
                 w = (M_flat * M_frame.unsqueeze(-1)).reshape(B, T * N, 1)
                 w = w / w.amax(dim=1, keepdim=True).clamp(min=1e-6)
-                Q_cbm = Q_flat * w
+                cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(Q_flat * w)
             else:
-                Q_cbm = Q_flat
-            cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(Q_cbm)
+                # Phase 27 raw-Q behaviour (no coupling; detection 0.914 but
+                # maps were decoration — k1 1.000, faith 0.071).
+                cbm_logit, concept_scores, slot_attn, cbm_blend = self.cbm(
+                    Q.reshape(B, T * N, d))
             if self.cbm_serial:
                 # Phase 27: pure serial bottleneck — cbm_logit is the sole
                 # prediction.  main_logit is only used by the aux loss.
@@ -407,5 +438,7 @@ class EAHN(nn.Module):
             cbm_blend=cbm_blend,
             domain_logits=domain_logits,
             cbm_serial=self.cbm_serial,
-            cbm_coupled=(self.cbm_coupled and self.cbm is not None),
+            cbm_coupled=(self.cbm_coupled and not self.cbm_pooled
+                         and self.cbm is not None),
+            cbm_pooled=(self.cbm_pooled and self.cbm is not None),
         )

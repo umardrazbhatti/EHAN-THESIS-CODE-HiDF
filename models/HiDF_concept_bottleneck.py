@@ -6,16 +6,35 @@ classifier and blended via a learnable sigmoid gate. Result: the model
 escaped through the main path, M_t got decoupled from prediction, and
 faithfulness_corr regressed (0.225 -> 0.079 over 8 epochs).
 
-PHASE 27 (serial bottleneck — current): the CBM is the SOLE classifier
+PHASE 27 (serial bottleneck): the CBM is the SOLE classifier
 path. The main Linear(d -> 1) head still exists but is used only as an
 auxiliary supervision signal (lambda_cbm_main_aux, small weight) and its
 output is exposed as `main_logit` for diagnostics — it is NOT part of the
 prediction `out.logit`. This forces all gradient through the K-concept
 bottleneck and removes the escape hatch.
 
-  Transformer Q (B, T*N, d)
+PHASE 28 (multiplicative coupling — DEAD): Q tokens scaled by
+w = M_t ⊙ M_frame before the CBM.  Scaling token MAGNITUDES by a peaky
+map starved the slot attention (782/784 near-zero keys soak up the
+softmax mass), slot_pool collapsed to ~0, cbm_logit froze at the fc
+bias and training never started (run 6-11-26 1300hrs: val AUC ~0.5 for
+9 epochs, cls loss constant at 0.1838).
+
+PHASE 29 (pooled-frame input + log-prior — current): the CBM reads the
+M_t-pooled per-frame vectors and receives M_frame as a LOG-space
+attention prior.  Both couplings are renormalised forms — pooling is a
+convex combination, the prior shifts softmax logits — so magnitude
+starvation is structurally impossible while M_t and M_frame remain
+load-bearing for the prediction (P23 precedent: same pooled path gave
+0.904 AUC / k1 1.64 under the old artifact-diluted protocol).
+
+  Transformer Q (B, T, N, d)
         │
-        └─ K learned slot queries -> soft-attention over (T*N) positions
+        ├─ attn_pool_per_frame[t] = Σ_n M_t[t,n] · Q[t,n]   (B, T, d)
+        │       (spatial coupling: FORCED — suppressed tokens are absent)
+        │
+        └─ K slot queries -> soft-attention over T frames with
+           attn_logits += log(M_frame)   (temporal coupling: prior)
             -> K pooled vectors (B, K, d)
             -> K scalar concept scores (B, K)
             -> Linear(K -> 1)            ─── cbm_logit = out.logit  (PRIMARY)
@@ -97,14 +116,34 @@ class ConceptSlotBottleneck(nn.Module):
         nn.init.xavier_uniform_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
 
-    def forward(self, Q: torch.Tensor):
-        """Q: (B, L, d). Returns (cbm_logit, concept_scores, slot_attn, blend_val)."""
+    def forward(self, Q: torch.Tensor, prior: torch.Tensor = None):
+        """Q: (B, L, d). Returns (cbm_logit, concept_scores, slot_attn, blend_val).
+
+        prior : (B, L) optional — a probability distribution over the L
+            positions (e.g. M_frame when L = T).  Added to the attention
+            logits in LOG space, so it biases WHERE slots look while the
+            softmax renormalises — slot_pool stays a convex combination of
+            full-magnitude tokens regardless of how peaky the prior is.
+            This is the Phase 29 coupling mechanism.  Phase 28's
+            multiplicative input scaling is the cautionary tale: scaling
+            token MAGNITUDES by a peaky map drove 782/784 keys to ~0, the
+            softmax diluted the survivors, slot_pool collapsed to the fc
+            bias, and the cls gradient died (run 6-11-26 1300hrs: cls
+            frozen at 0.1838 for 9 epochs).  A log-space prior cannot
+            reproduce that failure: softmax output always sums to 1 over
+            real tokens.
+        """
         B, L, d = Q.shape
         assert d == self.d, f"Q feature dim {d} != cbm.d {self.d}"
 
         # Scaled dot-product attention: (B, K, L)
         # logits[b, k, l] = (Q[b, l, :] · slot_q[k, :]) / sqrt(d)
         attn_logits = torch.einsum("bld,kd->bkl", Q, self.slot_q) / (d ** 0.5)
+        if prior is not None:
+            # log-prior coupling: clamp keeps the bias finite even if the
+            # prior has exact zeros (log(1e-6) ≈ -13.8 — strong but finite,
+            # so the cls gradient can still resurrect a suppressed frame).
+            attn_logits = attn_logits + prior.clamp(min=1e-6).log().unsqueeze(1)
         slot_attn   = F.softmax(attn_logits, dim=-1)           # (B, K, L), sums to 1 over L
 
         # Slot-pooled features: each slot gets its own d-dim vector

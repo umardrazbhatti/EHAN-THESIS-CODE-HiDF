@@ -252,8 +252,13 @@ def main(config: EAHNConfig):
         "train_cbm_main_aux":  [],                      # Phase 27: main_logit aux supervision
         "train_domain":        [],                      # Phase 27: DANN domain CE loss
         "train_domain_acc":    [],                      # Phase 27: DANN domain top-1 accuracy
-        "train_eff_tokens":    [],                      # Phase 28: effective token count of
-                                                        # w = M_t ⊙ M_frame (coupling width)
+        "train_eff_frames":    [],                      # Phase 29: effective frame count of
+                                                        # M_frame (1/Herfindahl, max T)
+        "train_eff_spatial":   [],                      # Phase 29: effective spatial tokens of
+                                                        # M_t per frame (1/Herfindahl, max N)
+        "train_slot_on_top":   [],                      # Phase 29: CBM slot-attention mass on
+                                                        # the top-M_frame frame (prior adherence;
+                                                        # 1/T ≈ 0.0625 = uniform / decoupled)
         "train_peak_spread":   [],                      # v2: new term
         "train_sharp":         [],                      # v3: sharpness loss
         "val_auc_roc":         [], "val_balanced_acc":      [],
@@ -324,7 +329,8 @@ def main(config: EAHNConfig):
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "cbm_main_aux": 0.0,                          # Phase 27
             "domain": 0.0, "domain_acc": 0.0,             # Phase 27
-            "eff_tokens": 0.0,                            # Phase 28
+            "eff_frames": 0.0, "eff_spatial": 0.0,        # Phase 29
+            "slot_on_top": 0.0,                           # Phase 29
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
         }
 
@@ -336,7 +342,8 @@ def main(config: EAHNConfig):
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "cbm_main_aux": 0.0,                          # Phase 27
             "domain": 0.0, "domain_acc": 0.0,             # Phase 27
-            "eff_tokens": 0.0,                            # Phase 28
+            "eff_frames": 0.0, "eff_spatial": 0.0,        # Phase 29
+            "slot_on_top": 0.0,                           # Phase 29
             "sparse": 0.0, "peak_spread": 0.0,
             "sharp": 0.0, "n": 0,
         }
@@ -632,6 +639,43 @@ def main(config: EAHNConfig):
                       f"w_peak={_w_peak:.4f}  "
                       f"eff_tokens={_eff_tokens:.1f}/{_w_diag.shape[1]}  "
                       f"M_frame_peak={float(out_A.M_frame.amax(dim=-1).mean().item()):.4f}")
+                # Phase 29: pooled-CBM coupling diagnostic.
+                #   eff_frames  = 1/Herfindahl(M_frame) — frames the prediction
+                #                 effectively sees (max T).
+                #   eff_spatial = mean 1/Herfindahl(M_t per frame) — spatial
+                #                 tokens per frame the pooling keeps (max N).
+                #   slot_on_top = CBM slot-attention mass on the top-M_frame
+                #                 frame (pooled mode) — prior-adherence probe.
+                #   logit_std   = THE Phase 28 lesson: a healthy head varies
+                #                 across samples; P28's starved head emitted a
+                #                 constant (cls frozen at 0.1838 for 9 epochs).
+                _pooled_diag = bool(getattr(out_A, "cbm_pooled", False))
+                with torch.no_grad():
+                    _eff_fr_d = float((1.0 / out_A.M_frame.pow(2).sum(dim=1)
+                                       .clamp(min=1e-12)).mean().item())
+                    _mt_d = out_A.M_t.reshape(_Bd, _Td, -1)
+                    _mt_d = _mt_d / _mt_d.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                    _eff_sp_d = float((1.0 / _mt_d.pow(2).sum(dim=-1)
+                                       .clamp(min=1e-12)).mean().item())
+                    if (out_A.slot_attn is not None
+                            and out_A.slot_attn.shape[-1] == _Td):
+                        _topf_d = out_A.M_frame.argmax(dim=1)
+                        _stop_d = float(out_A.slot_attn[
+                            torch.arange(_Bd, device=_topf_d.device), :, _topf_d
+                        ].mean().item())
+                    else:
+                        _stop_d = float("nan")
+                    _lstd_d = float(out_A.logit.detach().float().std().item())
+                print(f"[DIAG-P29] cbm_pooled={_pooled_diag}  "
+                      f"eff_frames={_eff_fr_d:.1f}/{_Td}  "
+                      f"eff_spatial={_eff_sp_d:.1f}/{_mt_d.shape[-1]}  "
+                      f"slot_on_top={_stop_d:.3f} (uniform={1.0/_Td:.3f})  "
+                      f"logit_std={_lstd_d:.2e}")
+                if _lstd_d < 1e-4:
+                    print("[DIAG-P29][WARNING] logit std < 1e-4 across the "
+                          "batch — the prediction head is emitting a "
+                          "near-constant output (Phase 28 failure signature); "
+                          "training will not learn from this state.")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -656,18 +700,35 @@ def main(config: EAHNConfig):
             _ls  = loss_sparse.item()
             _lps = l_peak_spread.item()
             _lsh = loss_sharp.item()
-            # Phase 28: effective token count of the coupling weight
-            # w = M_t ⊙ M_frame (1/Herfindahl of the sum-normalised weights).
-            # ≈ how many of the T*N tokens the CBM prediction can effectively
-            # see.  Collapse toward ~1 = bottleneck too brutal; staying ≈ T*N
-            # = maps near-uniform and coupling not biting.
+            # Phase 29: coupling-health diagnostics (replaces the Phase 28
+            # w-based eff_tokens, which measured a quantity that no longer
+            # exists in pooled mode).
+            #   eff_fr = 1/Herfindahl(M_frame)            — effective frames
+            #            the prediction sees (max T; →1 = temporal one-hot,
+            #            CBM slots starved of choice).
+            #   eff_sp = mean 1/Herfindahl(M_t per frame) — effective spatial
+            #            tokens each frame-vector pools (max N).
+            #   s_top  = CBM slot-attention mass on the top-M_frame frame
+            #            (pooled mode only).  Escape-hatch detector: if
+            #            M_frame goes peaky while s_top stays ≈ 1/T, the
+            #            slots' content term is overriding the log-prior and
+            #            the temporal coupling is decoupling again.
             with torch.no_grad():
                 _Bw, _Tw = out_A.M_frame.shape
-                _w_r = (out_A.M_t.reshape(_Bw, _Tw, -1)
-                        * out_A.M_frame.unsqueeze(-1)).reshape(_Bw, -1)
-                _w_r = _w_r / _w_r.sum(dim=1, keepdim=True).clamp(min=1e-12)
-                _eft = float((1.0 / _w_r.pow(2).sum(dim=1)
-                              .clamp(min=1e-12)).mean().item())
+                _eff_fr = float((1.0 / out_A.M_frame.pow(2).sum(dim=1)
+                                 .clamp(min=1e-12)).mean().item())
+                _mt_r = out_A.M_t.reshape(_Bw, _Tw, -1)
+                _mt_r = _mt_r / _mt_r.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                _eff_sp = float((1.0 / _mt_r.pow(2).sum(dim=-1)
+                                 .clamp(min=1e-12)).mean().item())
+                if (out_A.slot_attn is not None
+                        and out_A.slot_attn.shape[-1] == _Tw):
+                    _topf = out_A.M_frame.argmax(dim=1)               # (B,)
+                    _stop = float(out_A.slot_attn[
+                        torch.arange(_Bw, device=_topf.device), :, _topf
+                    ].mean().item())
+                else:
+                    _stop = 0.0
 
             run["total"]       += _lt;  run["cls"]    += _lc
             run["exp"]         += _le;  run["temp"]   += _lp
@@ -679,7 +740,9 @@ def main(config: EAHNConfig):
             run["cbm_main_aux"] += _lcm                           # Phase 27
             run["domain"]      += _ldm                            # Phase 27
             run["domain_acc"]  += _da                             # Phase 27
-            run["eff_tokens"]  += _eft                            # Phase 28
+            run["eff_frames"]  += _eff_fr                         # Phase 29
+            run["eff_spatial"] += _eff_sp                         # Phase 29
+            run["slot_on_top"] += _stop                           # Phase 29
             run["sparse"]      += _ls
             run["peak_spread"] += _lps; run["sharp"]  += _lsh; run["n"] += 1
 
@@ -692,7 +755,9 @@ def main(config: EAHNConfig):
             epoch_acc["cbm_main_aux"] += _lcm                               # Phase 27
             epoch_acc["domain"]      += _ldm                                # Phase 27
             epoch_acc["domain_acc"]  += _da                                 # Phase 27
-            epoch_acc["eff_tokens"]  += _eft                                # Phase 28
+            epoch_acc["eff_frames"]  += _eff_fr                             # Phase 29
+            epoch_acc["eff_spatial"] += _eff_sp                             # Phase 29
+            epoch_acc["slot_on_top"] += _stop                               # Phase 29
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -719,7 +784,9 @@ def main(config: EAHNConfig):
                     f"cbm_main={run['cbm_main_aux']/n:.4f}  "              # Phase 27
                     f"domain={run['domain']/n:.4f}  "                      # Phase 27
                     f"dom_acc={run['domain_acc']/n:.3f}  "                 # Phase 27
-                    f"eff_tok={run['eff_tokens']/n:.0f}  "                 # Phase 28
+                    f"eff_fr={run['eff_frames']/n:.1f}  "                  # Phase 29
+                    f"eff_sp={run['eff_spatial']/n:.1f}  "                 # Phase 29
+                    f"s_top={run['slot_on_top']/n:.3f}  "                  # Phase 29
                     f"sparse={run['sparse']/n:.4f}  "
                     f"sharp={run['sharp']/n:.4f}  "
                     f"peak_spread={run['peak_spread']/n:.4f}  "
@@ -735,7 +802,8 @@ def main(config: EAHNConfig):
                     "cbm_aux": 0.0, "cbm_div": 0.0,                        # Phase 26
                     "cbm_main_aux": 0.0,                                   # Phase 27
                     "domain": 0.0, "domain_acc": 0.0,                      # Phase 27
-                    "eff_tokens": 0.0,                                     # Phase 28
+                    "eff_frames": 0.0, "eff_spatial": 0.0,                 # Phase 29
+                    "slot_on_top": 0.0,                                    # Phase 29
                     "sparse": 0.0,
                     "peak_spread": 0.0, "sharp": 0.0, "n": 0,
                 }
@@ -757,7 +825,9 @@ def main(config: EAHNConfig):
         history["train_cbm_main_aux"].append(epoch_acc["cbm_main_aux"] / n)  # Phase 27
         history["train_domain"].append(epoch_acc["domain"]     / n)   # Phase 27
         history["train_domain_acc"].append(epoch_acc["domain_acc"] / n)     # Phase 27
-        history["train_eff_tokens"].append(epoch_acc["eff_tokens"] / n)     # Phase 28
+        history["train_eff_frames"].append(epoch_acc["eff_frames"] / n)     # Phase 29
+        history["train_eff_spatial"].append(epoch_acc["eff_spatial"] / n)   # Phase 29
+        history["train_slot_on_top"].append(epoch_acc["slot_on_top"] / n)   # Phase 29
         history["train_sparse"].append(epoch_acc["sparse"]     / n)
         history["train_peak_spread"].append(epoch_acc["peak_spread"] / n)
         history["train_sharp"].append(epoch_acc["sharp"] / n)
