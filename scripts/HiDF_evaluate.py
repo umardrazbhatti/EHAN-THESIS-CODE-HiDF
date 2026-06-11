@@ -533,14 +533,16 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         grad_7_avg.reshape(subset_size, -1),
     )
 
-    # ── Deletion / Insertion AUC (Phase 28: 20 clips, 20 steps, chunked) ───────
+    # ── Deletion / Insertion AUC (Phase 28: 20 steps, chunked) ─────────────────
     # Phase ≤27 capped at 5 clips because the metric forwarded ALL clips in one
     # batch (T4 OOM above ~5).  The metric now chunks its forwards (chunk=4),
     # so the whole heatmap subset is affordable.  steps 10 → 20 for smoother
     # curves; random-saliency control + fake-only aggregates added (Phase 28).
+    # Phase 30: cap 20 → 50 clips (follows heatmap_samples; the Phase ≤29
+    # headline del/ins rested on 20 clips — too noisy next to the suite's 50).
     import traceback as _traceback
     del_ins = {"deletion_auc": 0.0, "insertion_auc": 0.0}
-    _n_del_ins = min(subset_size, 20)
+    _n_del_ins = min(subset_size, 50)
     try:
         _di_frames_list = [test_ds[int(indices[i])]["frames"]
                            for i in range(_n_del_ins)]          # each (T,C,H,W)

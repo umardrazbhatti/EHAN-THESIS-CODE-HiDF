@@ -206,7 +206,8 @@ def build_bottlenecked_input(x: torch.Tensor,
                               blur_kernel: int = 21,
                               blur_sigma: float = 10.0,
                               peak_floor: float = 0.0,
-                              hard_topk_frac: float = 0.0) -> torch.Tensor:
+                              hard_topk_frac: float = 0.0,
+                              invert: bool = False) -> torch.Tensor:
     """Construct an M_t-gated input at image resolution.
 
     x   : (B, T, 3, H, W)
@@ -234,6 +235,23 @@ def build_bottlenecked_input(x: torch.Tensor,
       so optimising those losses directly optimises the metric.
 
       hard_topk_frac=0.0 (default) preserves Phase 22/24 behaviour.
+
+    Phase 30 — invert (deletion / necessity pass):
+      invert=False (default): x_b = M_norm·x + (1-M_norm)·blur — KEEP the
+        attended region, blur the rest (sufficiency: B-pass).
+      invert=True:            x_d = M_norm·blur + (1-M_norm)·x — ERASE the
+        attended region, keep the rest (necessity: D-pass).  Used by
+        loss_del, which demands the prediction fall toward "real" once the
+        M_t-marked evidence is removed.  Run 6-12-26 0020hrs showed why
+        sufficiency alone is not enough: the model classified fine from the
+        top region (loss_ins 0.14) but ALSO from everything else (deletion
+        AUC 0.502, worse than the 0.436 random control) — evidence was
+        redundant and the maps carried no necessity information.  The
+        degenerate solution "make M_norm small everywhere so x_d ≈ x" is
+        blocked by the same peak_floor that protects the B-pass: a diffuse
+        map gets divided by the 0.25 floor, which CRUSHES M_norm in the
+        B-pass and destroys loss_ins — the two passes pin the map from
+        both sides.
     """
     B, T, C, H, W = x.shape
     M_up = F.interpolate(
@@ -265,7 +283,11 @@ def build_bottlenecked_input(x: torch.Tensor,
 
     with torch.no_grad():
         x_blur = _gaussian_blur_5d(x.detach(), blur_kernel, blur_sigma)
-    x_b = M_norm * x + (1.0 - M_norm) * x_blur
+    if invert:
+        # Phase 30 D-pass: erase the attended region, keep the rest.
+        x_b = M_norm * x_blur + (1.0 - M_norm) * x
+    else:
+        x_b = M_norm * x + (1.0 - M_norm) * x_blur
     return x_b
 
 
@@ -313,5 +335,42 @@ def temporal_sparsity_loss(M_frame: torch.Tensor) -> torch.Tensor:
     where values were 0.033–0.079 against uniform 0.0625), the ranking is
     essentially random → top-K and random-K drops are equal → ratio ≈ 1.0
     or below by noise.  This loss adds pressure for the gate to commit.
+
+    Phase 27/28 post-mortem: this form is an OPEN-ENDED reward (-max keeps
+    paying all the way to one-hot) and drove M_frame to 99.998% one-hot in
+    P27 and accelerated the P28 collapse.  Superseded by temporal_band_loss
+    (Phase 30) — kept for ablation history.
     """
     return -M_frame.amax(dim=-1).mean()
+
+
+def temporal_band_loss(M_frame: torch.Tensor, target_eff: float = 6.0) -> torch.Tensor:
+    """Phase 30: BOUNDED temporal-selectivity penalty on M_frame.
+
+    eff(p) = 1 / Σ_t p_t²  (inverse Herfindahl — "effective frame count";
+    uniform over T frames → T, one-hot → 1).  Penalty:
+
+        loss = relu(eff - target_eff) / max(T - target_eff, 1)   per sample
+
+    Scaled to [0, 1]: uniform M_frame → 1, eff ≤ target_eff → EXACTLY 0.
+
+    Why a band and not a reward: temporal_sparsity_loss (-max) is an
+    open-ended ratchet — it kept paying gradient all the way to one-hot
+    (Phase 27: M_frame 99.998% on one frame; Phase 28: collapse
+    accelerant).  The hinge has zero gradient once eff_fr ≤ target_eff,
+    so the gate concentrates to ~target_eff frames and then ONLY the
+    classification signal decides where mass goes.  One-hot is reachable
+    only if cls itself wants it.
+
+    Why it matters (run 6-12-26 0020hrs): with lambda_temp_sparse=0 there
+    was no temporal pressure at all — eff_fr sat at 10–13/16, the top
+    frame carried 13% vs 6.25% uniform, and masking it moved confidence
+    by 0.0015 (noise).  k-drop absolute numbers cannot grow until the
+    gate commits to a subset of frames.
+
+    M_frame : (B, T) softmax over time, sums to 1 per sample.
+    """
+    T = M_frame.shape[-1]
+    eff = 1.0 / M_frame.pow(2).sum(dim=-1).clamp(min=1e-12)     # (B,)
+    scale = max(float(T) - float(target_eff), 1.0)
+    return F.relu(eff - float(target_eff)).mean() / scale

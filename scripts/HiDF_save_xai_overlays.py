@@ -1,9 +1,11 @@
 """
 scripts/save_xai_overlays.py — Save Grad-CAM + Attention-Rollout + intrinsic M_t
-overlay PNGs for 10 selected test videos (5 real + 5 fake).
+overlay PNGs for config.xai_overlay_videos selected test videos, split evenly
+real/fake (Phase 30: default 50 = 25 real + 25 fake; was hardcoded 10).
 
 Selection:
-  Per class: 2 high-confidence + 2 mid-confidence + 1 low-confidence.
+  Per class, in a 2:2:1 high:mid:low confidence ratio
+  (50 videos → 10 high + 10 mid + 5 low per class).
   High:  prob >= 0.7 (fake) or prob <= 0.3 (real)
   Mid:   0.4 <= prob <= 0.6
   Low:   prob closest to 0.5
@@ -47,6 +49,9 @@ def _select_samples(probs, labels, n_high=2, n_mid=2, n_low=1):
     """
     Select n_high + n_mid + n_low indices per class.
     Returns dict {"real": [idx, ...], "fake": [idx, ...]}.
+
+    Phase 30: n_low can be > 1 — the low bucket takes the n_low samples
+    whose prob is closest to 0.5 (was: single closest).
     """
     probs  = np.array(probs)
     labels = np.array(labels, dtype=int)
@@ -78,12 +83,12 @@ def _select_samples(probs, labels, n_high=2, n_mid=2, n_low=1):
         mid_idxs = cls_idxs[mid_mask]
         selected += list(mid_idxs[:n_mid])
 
-        # Low confidence: closest to 0.5
+        # Low confidence: the n_low samples closest to 0.5
         remaining = [i for i in cls_idxs if i not in set(selected)]
-        if remaining:
+        if remaining and n_low > 0:
             rem_probs = probs[remaining]
-            low_idx   = remaining[int(np.argmin(np.abs(rem_probs - 0.5)))]
-            selected += [low_idx]
+            _order    = np.argsort(np.abs(rem_probs - 0.5))
+            selected += [remaining[int(j)] for j in _order[:n_low]]
 
         # Pad or trim to n_high + n_mid + n_low
         target_n = n_high + n_mid + n_low
@@ -110,7 +115,9 @@ def _denormalize(frames_tensor) -> list:
 def save_xai_overlays(model, test_loader, config, output_dir: Path):
     """
     Generate and save Grad-CAM + Attention-Rollout + intrinsic M_t overlay PNGs
-    for 10 selected test videos (5 real + 5 fake).
+    for config.xai_overlay_videos selected test videos, split evenly real/fake
+    (Phase 30 default: 50 = 25 real + 25 fake, in a 2:2:1 high:mid:low
+    confidence ratio per class).
 
     Args:
         model       : trained EAHN model
@@ -150,15 +157,27 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
     all_M_t_up = torch.cat(_M_chunks, dim=0)                  # (N, T, H, W) GPU
     del _M_chunks
 
-    # ── Select 5 real + 5 fake ────────────────────────────────────────────────
-    selected = _select_samples(all_probs, all_labels, n_high=2, n_mid=2, n_low=1)
+    # ── Select N/2 real + N/2 fake (Phase 30: config-driven, default 50) ─────
+    _n_videos  = max(2, int(getattr(config, "xai_overlay_videos", 50)))
+    _per_class = max(1, _n_videos // 2)
+    # 2:2:1 high:mid:low confidence split per class (50 → 10/10/5 per class)
+    _n_high = max(1, round(_per_class * 0.4))
+    _n_mid  = max(1, round(_per_class * 0.4))
+    _n_low  = max(0, _per_class - _n_high - _n_mid)
+    selected = _select_samples(all_probs, all_labels,
+                               n_high=_n_high, n_mid=_n_mid, n_low=_n_low)
     chosen_indices = selected.get("real", []) + selected.get("fake", [])
     print(f"[XAI overlays] Selected {len(chosen_indices)} videos: "
-          f"real={len(selected.get('real',[]))} fake={len(selected.get('fake',[]))}")
+          f"real={len(selected.get('real',[]))} fake={len(selected.get('fake',[]))} "
+          f"(per-class high/mid/low = {_n_high}/{_n_mid}/{_n_low})")
 
     # ── Pass 2: collect frames only for chosen indices ───────────────────────
+    # Phase 30: frames stay on GPU (50 videos × 16×3×224×224 fp32 ≈ 480 MB —
+    # well inside the eval-time budget; the old CPU dict was the path that
+    # caused the 6-7-26 CPU-RAM OOM in the first place).  _denormalize moves
+    # ONE video at a time to CPU when it is actually rendered.
     chosen_set = set(int(i) for i in chosen_indices)
-    frames_by_idx = {}                                        # {int_idx: (T,C,H,W) CPU}
+    frames_by_idx = {}                                        # {int_idx: (T,C,H,W) GPU}
     _cursor = 0
     with torch.no_grad():
         for batch in test_loader:
@@ -166,14 +185,16 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
             _b = _frames_batch.shape[0]
             _global = list(range(_cursor, _cursor + _b))
             _local_keep = [(i, g) for i, g in enumerate(_global) if g in chosen_set]
-            for _i, _g in _local_keep:
-                # Keep on CPU here — only used for _denormalize which needs CPU anyway
-                frames_by_idx[_g] = _frames_batch[_i].detach().clone()
+            if _local_keep:
+                _frames_gpu = _frames_batch.to(device, non_blocking=True)
+                for _i, _g in _local_keep:
+                    frames_by_idx[_g] = _frames_gpu[_i].detach().clone()
+                del _frames_gpu
             _cursor += _b
             if len(frames_by_idx) >= len(chosen_set):
                 break
-    print(f"[XAI overlays] collected {len(frames_by_idx)} frame tensors "
-          f"(~{sum(f.numel()*4 for f in frames_by_idx.values())/1e6:.1f} MB CPU)")
+    print(f"[XAI overlays] collected {len(frames_by_idx)} frame tensors on GPU "
+          f"(~{sum(f.numel()*4 for f in frames_by_idx.values())/1e6:.1f} MB)")
 
     # ── Load explainers ───────────────────────────────────────────────────────
     from xai.HiDF_gradcam import GradCAMExplainer
@@ -204,9 +225,9 @@ def save_xai_overlays(model, test_loader, config, output_dir: Path):
         if idx not in frames_by_idx:
             print(f"  [XAI overlay] skip idx={idx} (no frames collected)")
             continue
-        _frame_cpu = frames_by_idx[idx]                 # (T, C, H, W) CPU
-        frames_t   = _frame_cpu.unsqueeze(0).to(device) # (1, T, C, H, W) GPU
-        orig_rgb   = _denormalize(_frame_cpu)           # list of T RGB arrays
+        _frame_gpu = frames_by_idx[idx]                 # (T, C, H, W) GPU (Phase 30)
+        frames_t   = _frame_gpu.unsqueeze(0)            # (1, T, C, H, W) GPU
+        orig_rgb   = _denormalize(_frame_gpu)           # moves this ONE video to CPU
 
         # Intrinsic M_t
         intrinsic = all_M_t_up[idx].detach().cpu().numpy()   # (T, H, W)

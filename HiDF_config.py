@@ -78,7 +78,11 @@ class EAHNConfig:
     save_last_checkpoint: bool = False      # Phase 16 leftover; OFF by default
     explanation_suite: bool = True          # run new explanation metrics block after eval
     save_heatmaps: bool = True
-    heatmap_samples: int = 20
+    heatmap_samples: int = 20               # explanation-metric subset (faith corr, SSIM,
+                                            # del/ins). Phase 30 runs pass 50 via CLI.
+    xai_overlay_videos: int = 50            # Phase 30: XAI overlay PNG sample size
+                                            # (was hardcoded 10 = 5 real + 5 fake).
+                                            # Split per class 2:2:1 high:mid:low conf.
     random_test_n_samples: int = 30         # Task 1.7: n_random for model-randomization check (was 1)
 
     # ── Early stopping (Task 3.3) ─────────────────────────────────────────────
@@ -150,7 +154,33 @@ class EAHNConfig:
                                           # artifact-diluted protocol.
     cbm_num_slots:         int   = 12     # Phase 27: K = 12 (was 8 in Phase 26)
     lambda_cbm_aux:        float = 0.10   # weight on CBM auxiliary classification loss
-    lambda_cbm_div:        float = 0.05   # weight on slot diversity loss
+    lambda_cbm_div:        float = 0.05   # weight on slot diversity loss.  Phase 30:
+                                          # run with 0.15 — at 0.05 (and slot_q init
+                                          # 0.02) cbm_div stayed pinned 0.98–1.0 for
+                                          # 9 epochs (run 6-12-26 0020hrs): all 12
+                                          # slots identical, effective K=1.
+    # ── Phase 30: necessity (deletion) pass + bounded temporal band ──────────
+    lambda_del:            float = 0.3    # weight for the deletion loss: classify the
+                                          # INVERSE-bottlenecked input (top-M_t region
+                                          # blurred, rest visible) as REAL.  Trains
+                                          # NECESSITY — all fake evidence must live
+                                          # under the map.  Complements loss_ins
+                                          # (sufficiency).  Run 6-12-26 0020hrs:
+                                          # without it, deletion AUC 0.502 was WORSE
+                                          # than the 0.436 random control.  Alternates
+                                          # with the B-pass (even/odd steps) so the
+                                          # per-step forward count stays at 2.
+                                          # Shares faith_warmup_epochs.  0.0 = off.
+    lambda_temp_band:      float = 0.05   # weight for temporal_band_loss: hinge
+                                          # penalty when eff_fr = 1/Σp² exceeds
+                                          # temp_band_target.  ZERO gradient below
+                                          # the target — cannot ratchet to one-hot
+                                          # (the P27 lambda_temp_sparse failure).
+                                          # 0.0 = off.
+    temp_band_target:      float = 6.0    # eff_fr the band allows before penalising
+                                          # (of T=16). 6 effective frames keeps the
+                                          # top frame at ~17-25% mass — enough for
+                                          # measurable k1 drops without one-hot.
     lambda_cbm_main_aux:   float = 0.05   # Phase 27: aux supervision on main_logit
                                           # (NOT in prediction path; just a regulariser
                                           # so we can diagnose whether attn_pool alone
@@ -339,7 +369,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_temp_sparse", type=float, default=None,
                         help="Phase 25: weight for temporal_sparsity_loss on M_frame "
                              "(default 0.02). Pushes temporal_gate toward peaky M_frame so "
-                             "k1/k2/k4 frame-drop ratios exceed 1.0x.")
+                             "k1/k2/k4 frame-drop ratios exceed 1.0x. Phase 30: superseded "
+                             "by --lambda_temp_band (bounded); keep this at 0.0.")
+    # ── Phase 30: necessity pass + bounded temporal band + overlay count ──
+    parser.add_argument("--lambda_del", type=float, default=None,
+                        help="Phase 30: weight for the deletion (necessity) loss — "
+                             "the inverse-bottlenecked input (top-M_t region blurred, "
+                             "rest visible) must classify as REAL. Alternates with the "
+                             "B-pass per step; shares faith_warmup_epochs. Default 0.3; "
+                             "0.0 disables (ablation).")
+    parser.add_argument("--lambda_temp_band", type=float, default=None,
+                        help="Phase 30: weight for temporal_band_loss — hinge penalty "
+                             "when eff_fr=1/sum(p^2) exceeds temp_band_target. Zero "
+                             "gradient below target (no one-hot ratchet). Default 0.05; "
+                             "0.0 disables (ablation).")
+    parser.add_argument("--temp_band_target", type=float, default=None,
+                        help="Phase 30: effective-frame count the temporal band allows "
+                             "before penalising (default 6.0 of T=16).")
+    parser.add_argument("--xai_overlay_videos", type=int, default=None,
+                        help="Phase 30: number of XAI overlay videos saved at eval "
+                             "(default 50 = 25 real + 25 fake; was 10).")
     parser.add_argument("--refine_gate_init", type=float, default=None,
                         help="Phase 26: initial value of bidirectional refine_gate parameter. "
                              "alpha = sigmoid(refine_gate_init). Default -0.5 → alpha=0.378 so "

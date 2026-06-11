@@ -20,13 +20,29 @@ softmax mass), slot_pool collapsed to ~0, cbm_logit froze at the fc
 bias and training never started (run 6-11-26 1300hrs: val AUC ~0.5 for
 9 epochs, cls loss constant at 0.1838).
 
-PHASE 29 (pooled-frame input + log-prior — current): the CBM reads the
+PHASE 29 (pooled-frame input + log-prior): the CBM reads the
 M_t-pooled per-frame vectors and receives M_frame as a LOG-space
 attention prior.  Both couplings are renormalised forms — pooling is a
 convex combination, the prior shifts softmax logits — so magnitude
 starvation is structurally impossible while M_t and M_frame remain
 load-bearing for the prediction (P23 precedent: same pooled path gave
 0.904 AUC / k1 1.64 under the old artifact-diluted protocol).
+Run 6-12-26 0020hrs: trained fine (0.879) but cbm_div stayed pinned at
+0.98–1.0 — ALL K slots identical.
+
+PHASE 30 (slot-scale repair — current): root cause of the P29 slot
+collapse was INIT SCALE, not the loss.  slot_q was initialised at
+N(0, 0.02²): with LayerNorm'd Q the slot logits are
+Q·q/√d ~ N(0, σ²) = ±0.02, while the log(M_frame) prior spans ±1–2.
+The prior outweighed slot identity ~100×, every slot softmax reduced
+to the SAME prior-shaped distribution, slot_pool rows were clones, and
+the diversity loss had no gradient traction (softmax is flat in a
+±0.02 logit neighbourhood).  Fix: slot_q init N(0, 1) so slot logits
+are the same order as the prior from batch 1 — random 256-d queries
+are near-orthogonal (E[cos] ≈ 1/√d ≈ 0.06), so the K attention rows
+differ immediately and lambda_cbm_div (raised 0.05 → 0.15) keeps them
+apart.  Watch cbm_div: must fall below ~0.9 by epoch 2 and keep
+falling; pinned ≥ 0.95 = collapse again.
 
   Transformer Q (B, T, N, d)
         │
@@ -103,8 +119,15 @@ class ConceptSlotBottleneck(nn.Module):
         self.K = int(num_slots)
         self.d = int(d_model)
 
-        # K learned query vectors — each defines one concept
-        self.slot_q = nn.Parameter(torch.randn(self.K, self.d) * 0.02)
+        # K learned query vectors — each defines one concept.
+        # Phase 30: init scale 0.02 → 1.0.  At 0.02 the slot logits
+        # (Q·q/√d ≈ ±0.02) were ~100× smaller than the log(M_frame) prior
+        # (±1–2), so all K slots collapsed onto the prior's shape from
+        # batch 1 (run 6-12-26 0020hrs: cbm_div pinned 0.98–1.0 for 9
+        # epochs).  Unit-scale queries give logits the same order as the
+        # prior; random 256-d directions are near-orthogonal, so slots
+        # differentiate immediately.
+        self.slot_q = nn.Parameter(torch.randn(self.K, self.d))
         # K learned value vectors — projects each pooled slot vector to a scalar
         self.slot_v = nn.Parameter(torch.randn(self.K, self.d) * 0.02)
         # Final classifier on K concept scores

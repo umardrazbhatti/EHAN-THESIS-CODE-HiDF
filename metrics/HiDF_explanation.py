@@ -37,15 +37,31 @@ class ExplanationMetrics:
         grad_flat: torch.Tensor,  # (subset, K) — gradient maps flattened
     ) -> float:
         """
-        Spearman rank correlation between intrinsic attention and gradient attribution.
-        Both tensors must already be (subset, K) with the same K.
+        Mean PER-SAMPLE Spearman rank correlation between intrinsic attention
+        and gradient attribution.
+
+        Phase 30 fix: the previous implementation flattened all samples into
+        one long vector before correlating.  M_t maps are softmax-normalised
+        (same scale every sample) but raw |gradient| magnitudes differ by
+        orders of magnitude between samples, so the pooled ranking was
+        dominated by BETWEEN-sample gradient scale — a quantity that says
+        nothing about whether the map ranks cells correctly WITHIN a video.
+        The standard formulation (Quantus / saliency literature) is rank
+        correlation per explanation, averaged over the evaluation set; rank
+        correlation is scale-invariant per sample, so no normalisation is
+        needed.  Samples with degenerate (constant) maps are skipped.
         """
-        m = M_flat.detach().cpu().numpy().flatten()
-        g = grad_flat.detach().cpu().numpy().flatten()
-        if len(m) < 3 or np.std(m) < 1e-8 or np.std(g) < 1e-8:
-            return 0.0
-        corr, _ = spearmanr(m, g)
-        return float(corr) if not np.isnan(corr) else 0.0
+        m_all = M_flat.detach().cpu().numpy()
+        g_all = grad_flat.detach().cpu().numpy()
+        corrs = []
+        for i in range(m_all.shape[0]):
+            m, g = m_all[i], g_all[i]
+            if len(m) < 3 or np.std(m) < 1e-12 or np.std(g) < 1e-12:
+                continue
+            corr, _ = spearmanr(m, g)
+            if not np.isnan(corr):
+                corrs.append(float(corr))
+        return float(np.mean(corrs)) if corrs else 0.0
 
     @staticmethod
     def deletion_insertion_auc(model, frames, saliency,
