@@ -46,6 +46,8 @@ from losses.HiDF_explanation import (
     sparsity_loss,
     temporal_sparsity_loss,       # Phase 25: pushes M_frame to be peaky → k1/k2/k4 > 1
     temporal_band_loss,           # Phase 30: bounded hinge on eff_fr (no one-hot ratchet)
+    spatial_band_loss,            # Phase 31: bounded two-sided hinge on eff_sp (replaces -peak)
+    full_blur_input,              # Phase 31: D-pass anchor step (full blur, no M_t dependence)
     cbm_diversity_loss,           # Phase 26: slot diversity (re-export wrapper)
 )
 from losses.HiDF_temporal import TemporalConsistencyLoss
@@ -257,6 +259,7 @@ def main(config: EAHNConfig):
                                                         # on the D-pass — inverse bottleneck
                                                         # classified toward REAL
         "train_temp_band":     [],                      # Phase 30: bounded eff_fr hinge
+        "train_spatial_band":  [],                      # Phase 31: bounded eff_sp hinge
         "train_eff_frames":    [],                      # Phase 29: effective frame count of
                                                         # M_frame (1/Herfindahl, max T)
         "train_eff_spatial":   [],                      # Phase 29: effective spatial tokens of
@@ -331,6 +334,7 @@ def main(config: EAHNConfig):
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "faith": 0.0, "ins": 0.0,                   # Phase 24
             "del": 0.0, "temp_band": 0.0,                # Phase 30
+            "spatial_band": 0.0,                         # Phase 31
             "temp_sparse": 0.0,                          # Phase 25
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "cbm_main_aux": 0.0,                          # Phase 27
@@ -346,6 +350,7 @@ def main(config: EAHNConfig):
             "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
             "cons": 0.0, "faith": 0.0, "ins": 0.0,      # Phase 24
             "del": 0.0, "temp_band": 0.0,                # Phase 30
+            "spatial_band": 0.0,                         # Phase 31
             "temp_sparse": 0.0,                          # Phase 25
             "cbm_aux": 0.0, "cbm_div": 0.0,              # Phase 26
             "cbm_main_aux": 0.0,                          # Phase 27
@@ -416,7 +421,6 @@ def main(config: EAHNConfig):
                     )
                     out_B       = model(x_b)           # GRAD ENABLED (v2 fix)
                     loss_faith  = faithfulness_loss(logits_A, out_B.logit)
-                    loss_sparse = sparsity_loss(M_t)
                     # ── Phase 24: insertion-AUC training loss ─────────────────
                     # Re-use the existing bottleneck forward.  Where loss_faith
                     # only requires logits_B to MATCH logits_A (which the model
@@ -438,44 +442,102 @@ def main(config: EAHNConfig):
                     # uniform 0.0625), which pinned k1/k2/k4 ratios below 1.0.
                     loss_temp_sparse = temporal_sparsity_loss(out_A.M_frame)
                 elif config.phase21_enabled:
-                    # ── Phase 30 Pass D: DELETION (necessity) ─────────────────
-                    # Inverse bottleneck: the top-M_t region is REPLACED by blur,
-                    # everything else stays visible.  Target is REAL (0) for ALL
-                    # samples:
-                    #   real clip  → blurring a patch must not create "fake"  ✓
-                    #   fake clip  → once the map-marked evidence is erased the
-                    #                model must no longer be able to call it
-                    #                fake — i.e. ALL decisive evidence must live
-                    #                under the map (necessity).
-                    # Run 6-12-26 0020hrs measured the gap this closes: deletion
-                    # AUC 0.502 was WORSE than the 0.436 random control — the
-                    # model's evidence was redundant outside the map.  The B-pass
-                    # (sufficiency) cannot fix that by construction.
-                    # Gradient reaches M_t through M_norm exactly as in pass B.
-                    x_d = build_bottlenecked_input(
-                        frames, M_t,
-                        blur_kernel=config.blur_kernel,
-                        blur_sigma=config.blur_sigma,
-                        peak_floor=config.bottleneck_peak_floor,
-                        hard_topk_frac=float(getattr(
-                            config, "bottleneck_hard_topk_frac", 0.0
-                        )),
-                        invert=True,
+                    # ── Phase 31 Pass D: DELETION (necessity), detoxed ────────
+                    # P30 post-mortem (run 6-12-26 1300hrs): BCE-to-0 on ALL
+                    # samples demanded CERTAIN-REAL on fakes whose erased
+                    # footprint was ~2/49 cells — 96% of the face still visible
+                    # — on half of all steps.  That is systematic "visible fake
+                    # evidence → REAL" supervision: train_clean fake_acc fell to
+                    # 0.40, val fake_acc hit 0.082 the first epoch the warmup
+                    # reached full strength (E4), test AUC 0.879 → 0.796.  The
+                    # necessity SIGNAL worked (del_gain_over_random +0.098, the
+                    # first positive ever) — only the loss form was poisonous.
+                    #
+                    # Three sub-passes now:
+                    #  ANCHOR (every del_anchor_every-th batch): x_d = full blur,
+                    #    target REAL for all.  No evidence visible ⇒ REAL is the
+                    #    correct label for BOTH classes; anchors the blur end of
+                    #    the del/ins eval curves (P30 blurred_conf 0.40 floored
+                    #    deletion AUC at ~0.40).  No M_t dependence — pure
+                    #    classifier shaping; the B-pass ("blur canvas + sharp
+                    #    top region → TRUE label") trains the opposing case so
+                    #    blur itself cannot become a class marker.
+                    #  ERASE, real samples: cls_loss_fn(logit_D, 0) — REAL is
+                    #    the true label (blur-spot augmentation; also kills the
+                    #    "blur present → fake" shortcut direction).
+                    #  ERASE, fake samples: hinge relu(logit_D − margin), only
+                    #    on fakes the A-pass currently detects (p_A > 0.5).
+                    #    Pushes p(fake|evidence erased) to ≤ sigmoid(margin)
+                    #    then STOPS — necessity without certainty-REAL.  The
+                    #    detected-gate skips fakes the model cannot classify
+                    #    anyway (no point flipping an undetected sample, and
+                    #    early in training that is most of them).
+                    _is_anchor_step = bool(
+                        int(getattr(config, "del_anchor_every", 8)) > 0
+                        and (batch_idx % int(getattr(config, "del_anchor_every", 8))
+                             == int(getattr(config, "del_anchor_every", 8)) - 1)
                     )
-                    out_D    = model(x_d)
-                    loss_del = cls_loss_fn(
-                        out_D.logit, torch.zeros_like(labels)
-                    )
-                    loss_sparse      = sparsity_loss(M_t)
+                    if _is_anchor_step:
+                        x_d = full_blur_input(
+                            frames,
+                            blur_kernel=config.blur_kernel,
+                            blur_sigma=config.blur_sigma,
+                        )
+                        out_D    = model(x_d)
+                        loss_del = cls_loss_fn(
+                            out_D.logit, torch.zeros_like(labels)
+                        )
+                    else:
+                        x_d = build_bottlenecked_input(
+                            frames, M_t,
+                            blur_kernel=config.blur_kernel,
+                            blur_sigma=config.blur_sigma,
+                            peak_floor=config.bottleneck_peak_floor,
+                            hard_topk_frac=float(getattr(
+                                config, "bottleneck_hard_topk_frac", 0.0
+                            )),
+                            invert=True,
+                        )
+                        out_D = model(x_d)
+                        _lbl_f       = labels.float().view_as(out_D.logit)
+                        _real_mask   = _lbl_f < 0.5
+                        _detected    = (torch.sigmoid(
+                            logits_A.detach().view_as(out_D.logit)) > 0.5)
+                        _fake_mask   = (_lbl_f >= 0.5) & _detected
+                        _del_margin  = float(getattr(
+                            config, "del_margin_logit", 0.0))
+                        _del_terms   = []
+                        if _real_mask.any():
+                            _del_terms.append(cls_loss_fn(
+                                out_D.logit[_real_mask],
+                                torch.zeros_like(out_D.logit[_real_mask]),
+                            ))
+                        if _fake_mask.any():
+                            _del_terms.append(F.relu(
+                                out_D.logit[_fake_mask] - _del_margin
+                            ).mean())
+                        loss_del = (torch.stack(_del_terms).sum()
+                                    if _del_terms
+                                    else torch.zeros((), device=frames.device))
                     loss_temp_sparse = temporal_sparsity_loss(out_A.M_frame)
                     loss_faith       = torch.zeros((), device=frames.device)
                     loss_ins         = torch.zeros((), device=frames.device)
                 else:
                     loss_faith       = torch.zeros((), device=frames.device)
-                    loss_sparse      = torch.zeros((), device=frames.device)
                     loss_ins         = torch.zeros((), device=frames.device)
                     loss_del         = torch.zeros((), device=frames.device)
                     loss_temp_sparse = torch.zeros((), device=frames.device)
+
+                # ── Phase 31: sparsity is DIAGNOSTIC-ONLY now ─────────────────
+                # Computed every phase21 step for log continuity; run with
+                # lambda_sparse=0.0 — the -peak reward is an open-ended ratchet
+                # that squeezed eff_sp from 3.4 (P29) to 1.8/49 cells (P30) and
+                # starved detection.  spatial_band_loss below is the bounded
+                # replacement.
+                if config.phase21_enabled:
+                    loss_sparse = sparsity_loss(M_t)
+                else:
+                    loss_sparse = torch.zeros((), device=frames.device)
 
                 # ── Phase 30: bounded temporal band (every step, A-pass only) ──
                 # Hinge on eff_fr = 1/Σp²: penalty above temp_band_target, ZERO
@@ -489,6 +551,23 @@ def main(config: EAHNConfig):
                     )
                 else:
                     loss_temp_band = torch.zeros((), device=frames.device)
+
+                # ── Phase 31: bounded spatial band (every step, A-pass only) ──
+                # Two-sided hinge on per-frame eff_sp = 1/Σp² over the 49
+                # cells: penalty above spatial_band_hi (too diffuse — B-pass
+                # needs a concentrated keep-region) and below spatial_band_lo
+                # (too concentrated — P30 collapsed to 1.8 cells, starving
+                # detection and reducing the insertion ordering to ~2 cells of
+                # signal).  Zero gradient inside the band.
+                if (config.phase21_enabled
+                        and float(getattr(config, "lambda_spatial_band", 0.0)) > 0.0):
+                    loss_spatial_band = spatial_band_loss(
+                        M_t,
+                        lo=float(getattr(config, "spatial_band_lo", 4.0)),
+                        hi=float(getattr(config, "spatial_band_hi", 10.0)),
+                    )
+                else:
+                    loss_spatial_band = torch.zeros((), device=frames.device)
 
                 # ── Phase 26+27: CBM auxiliary losses ─────────────────────────
                 # Phase 27 serial mode:
@@ -591,6 +670,13 @@ def main(config: EAHNConfig):
                     epoch, config.faith_warmup_epochs,
                     float(getattr(config, "lambda_temp_band", 0.0)),
                 )
+                # Phase 31: spatial band — same warmup; the lower hinge must
+                # not fight the early concentration that loss_ins needs to get
+                # the peak above the 0.25 floor, so it ramps in alongside it.
+                lam_sband_eff = _faith_warmup(
+                    epoch, config.faith_warmup_epochs,
+                    float(getattr(config, "lambda_spatial_band", 0.0)),
+                )
 
                 # Phase 26: CBM weight hyperparameters (no warmup — CBM is a
                 # parallel head that benefits from learning concept structure
@@ -603,10 +689,11 @@ def main(config: EAHNConfig):
                 l_total = (loss_cls
                            + lam_faith_eff          * loss_faith
                            + lam_ins_eff            * loss_ins
-                           + lam_del_eff             * loss_del          # Phase 30
+                           + lam_del_eff             * loss_del          # Phase 30/31
                            + config.lambda_sparse    * loss_sparse
                            + lam_temp_sparse_eff     * loss_temp_sparse  # Phase 25
                            + lam_tband_eff           * loss_temp_band    # Phase 30
+                           + lam_sband_eff           * loss_spatial_band # Phase 31
                            + _lambda1_eff            * l_exp
                            + config.lambda2          * l_temp
                            + _lambda_peak_spread     * l_peak_spread
@@ -791,6 +878,35 @@ def main(config: EAHNConfig):
                           "are too small to compete with the log(M_frame) "
                           "prior; all K slots will collapse onto the prior "
                           "shape (Phase 29 failure signature).")
+                # Phase 31: D-pass detox + spatial band + class-conditional
+                # focal alpha.
+                #   del form     — fakes get hinge relu(logit−margin) gated on
+                #                  A-pass detection; reals BCE-to-REAL (true
+                #                  label); every del_anchor_every-th batch is a
+                #                  full-blur anchor (target REAL, no M_t dep).
+                #   L_spatial_band at init should be > 0 (init eff_sp ~17 > hi)
+                #                  and fall toward 0 as eff_sp enters [lo, hi].
+                #   alpha_pos/neg — fake/real error weights; -1 = legacy global.
+                _lam_sband_cfg = float(getattr(config, "lambda_spatial_band", 0.0))
+                _sband_lo      = float(getattr(config, "spatial_band_lo", 4.0))
+                _sband_hi      = float(getattr(config, "spatial_band_hi", 10.0))
+                _del_margin_d  = float(getattr(config, "del_margin_logit", 0.0))
+                _anchor_every  = int(getattr(config, "del_anchor_every", 8))
+                _ap = float(getattr(config, "focal_alpha_pos", -1.0))
+                _an = float(getattr(config, "focal_alpha_neg", -1.0))
+                print(f"[DIAG-P31] lambda_spatial_band={_lam_sband_cfg}  "
+                      f"band=[{_sband_lo},{_sband_hi}]  "
+                      f"L_spatial_band={loss_spatial_band.item():.4f}  "
+                      f"del_margin_logit={_del_margin_d}  "
+                      f"del_anchor_every={_anchor_every}  "
+                      f"focal_alpha_pos={_ap}  focal_alpha_neg={_an}  "
+                      f"lambda_sparse={config.lambda_sparse} (0.0 expected — "
+                      f"superseded by spatial band)")
+                if float(config.lambda_sparse) > 0.0 and _lam_sband_cfg > 0.0:
+                    print("[DIAG-P31][WARNING] both lambda_sparse and "
+                          "lambda_spatial_band are active — the -peak ratchet "
+                          "will fight the band's lower hinge; set "
+                          "--lambda_sparse 0.0.")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -808,6 +924,7 @@ def main(config: EAHNConfig):
             _li  = loss_ins.item()                        # Phase 24
             _ld  = loss_del.item()                        # Phase 30
             _ltb = loss_temp_band.item()                  # Phase 30
+            _lsb = loss_spatial_band.item()               # Phase 31
             _lts = loss_temp_sparse.item()                # Phase 25
             _lca = loss_cbm_aux.item()                    # Phase 26
             _lcd = loss_cbm_div.item()                    # Phase 26
@@ -852,6 +969,7 @@ def main(config: EAHNConfig):
             run["cons"]        += _lco
             run["faith"]       += _lf;  run["ins"]    += _li     # Phase 24
             run["del"]         += _ld;  run["temp_band"] += _ltb # Phase 30
+            run["spatial_band"] += _lsb                           # Phase 31
             run["temp_sparse"] += _lts                            # Phase 25
             run["cbm_aux"]     += _lca                            # Phase 26
             run["cbm_div"]     += _lcd                            # Phase 26
@@ -876,6 +994,7 @@ def main(config: EAHNConfig):
             epoch_acc["faith"]       += _lf;  epoch_acc["ins"]    += _li   # Phase 24
             epoch_acc["del"]         += _ld                                 # Phase 30
             epoch_acc["temp_band"]   += _ltb                                # Phase 30
+            epoch_acc["spatial_band"] += _lsb                               # Phase 31
             epoch_acc["temp_sparse"] += _lts                                # Phase 25
             epoch_acc["cbm_aux"]     += _lca                                # Phase 26
             epoch_acc["cbm_div"]     += _lcd                                # Phase 26
@@ -914,6 +1033,7 @@ def main(config: EAHNConfig):
                     f"faith={run['faith']/n_b:.4f}  ins={run['ins']/n_b:.4f}  "
                     f"del={run['del']/n_d:.4f}  "                          # Phase 30
                     f"tband={run['temp_band']/n:.4f}  "                    # Phase 30
+                    f"sband={run['spatial_band']/n:.4f}  "                 # Phase 31
                     f"tsparse={run['temp_sparse']/n:.4f}  "                # Phase 25
                     f"cbm_aux={run['cbm_aux']/n:.4f}  "                    # Phase 26
                     f"cbm_div={run['cbm_div']/n:.4f}  "                    # Phase 26
@@ -935,6 +1055,7 @@ def main(config: EAHNConfig):
                     "total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0,
                     "cons": 0.0, "faith": 0.0, "ins": 0.0,
                     "del": 0.0, "temp_band": 0.0,                          # Phase 30
+                    "spatial_band": 0.0,                                   # Phase 31
                     "temp_sparse": 0.0,                                    # Phase 25
                     "cbm_aux": 0.0, "cbm_div": 0.0,                        # Phase 26
                     "cbm_main_aux": 0.0,                                   # Phase 27
@@ -963,6 +1084,7 @@ def main(config: EAHNConfig):
         history["train_ins"].append(epoch_acc["ins"]           / n_b)   # Phase 24
         history["train_del"].append(epoch_acc["del"]           / n_d)   # Phase 30
         history["train_temp_band"].append(epoch_acc["temp_band"] / n)   # Phase 30
+        history["train_spatial_band"].append(epoch_acc["spatial_band"] / n)  # Phase 31
         history["train_temp_sparse"].append(epoch_acc["temp_sparse"] / n)   # Phase 25
         history["train_cbm_aux"].append(epoch_acc["cbm_aux"]   / n)   # Phase 26
         history["train_cbm_div"].append(epoch_acc["cbm_div"]   / n)   # Phase 26
@@ -1190,6 +1312,7 @@ def main(config: EAHNConfig):
                 "train_loss_faith":     _avg("faith"),
                 "train_loss_del":       _avg("del"),          # Phase 30
                 "train_loss_temp_band": _avg("temp_band"),    # Phase 30
+                "train_loss_spatial_band": _avg("spatial_band"),  # Phase 31
                 "train_loss_sparse":    _avg("sparse"),
                 "train_loss_peak_spread": _avg("peak_spread"),
                 "train_loss_exp":       _avg("exp"),

@@ -325,6 +325,27 @@ class ExplanationMetrics:
         }
 
     @staticmethod
+    def _gauss_blur_frames(x: torch.Tensor, k: int = 21,
+                           sigma: float = 10.0) -> torch.Tensor:
+        """Separable Gaussian blur for a stack of frames (n, C, H, W).
+
+        Same kernel as the deletion/insertion protocol (k=21, sigma=10) so
+        the blur-fill frame-drop numbers live on the same evidence-removal
+        scale as the del/ins curves.
+        """
+        import torch.nn.functional as _F
+        n, C, H, W = x.shape
+        ax = torch.arange(k, dtype=torch.float32, device=x.device) - (k - 1) / 2
+        g = torch.exp(-(ax ** 2) / (2 * sigma * sigma))
+        g = g / g.sum()
+        kx = g.view(1, 1, 1, k).expand(C, 1, 1, k).contiguous()
+        ky = g.view(1, 1, k, 1).expand(C, 1, k, 1).contiguous()
+        pad = k // 2
+        out = _F.conv2d(x, kx, padding=(0, pad), groups=C)
+        out = _F.conv2d(out, ky, padding=(pad, 0), groups=C)
+        return out
+
+    @staticmethod
     def _mask_frames(clip: torch.Tensor, drop_idx, mode: str) -> torch.Tensor:
         """Remove frames at drop_idx from clip (1, T, C, H, W), in place.
 
@@ -332,6 +353,18 @@ class ExplanationMetrics:
             its nearest non-dropped neighbour (freeze-frame).  Stays
             in-distribution — removes the dropped frame's unique evidence
             without injecting an out-of-distribution artifact.
+            Phase 31 caveat (run 6-12-26 1300hrs): on a FULLY-FAKE clip with
+            16 temporally-redundant frames the neighbour carries the SAME
+            class evidence, so replicate-fill measures a quantity that is
+            physically ≈ 0 for any map — top-vs-random ratios from this fill
+            are noise/noise (P29's +5.12 and P30's −19.2 are the same coin
+            flip).  Reported for cross-phase continuity only.
+        mode="blur" (Phase 31 primary): dropped frames are Gaussian-blurred
+            in place (same kernel as the del/ins protocol).  DESTROYS the
+            evidence in those frames instead of copying it back in from a
+            neighbour, while staying closer to the input manifold than gray
+            fill — the only fill of the three that can show a top-vs-random
+            differential on fully-fake clips.
         mode="zero" (legacy, Phase ≤27): frames set to 0 in normalised space
             (≈ ImageNet-mean gray).  Phase 27 measured a +0.37 fake-prob shift
             for ANY masked frame — the gray-frame artifact swamped the
@@ -339,6 +372,10 @@ class ExplanationMetrics:
         """
         T = clip.shape[1]
         drop_set = {int(i) for i in drop_idx}
+        if mode == "blur":
+            idx = list(drop_set)
+            clip[0, idx] = ExplanationMetrics._gauss_blur_frames(clip[0, idx])
+            return clip
         if mode == "zero" or len(drop_set) >= T:
             clip[0, list(drop_set)] = 0.0
             return clip
@@ -369,8 +406,20 @@ class ExplanationMetrics:
         numbers are still computed in the same pass and reported under
         *_zerofill keys for cross-phase comparability.
 
+        Phase 31 protocol change: a BLUR fill is added (*_blurfill keys)
+        and becomes the headline protocol.  Replicate fill copies the
+        nearest kept frame back in — on fully-fake, temporally-redundant
+        clips the replacement frame carries the same class evidence, so
+        single-frame "necessity" is physically ≈ 0 for ANY map and the
+        replicate ratios are noise/noise.  Blur fill destroys the evidence
+        in the dropped frames (same Gaussian as the del/ins protocol), so a
+        temporal map that ranks evidence-bearing frames higher CAN show
+        top > random here.
+
         Returns dict with keys (per K):
             k{K}_top_conf_drop, k{K}_random_conf_drop, k{K}_ratio          (replicate fill)
+            k{K}_top_conf_drop_blurfill, k{K}_random_conf_drop_blurfill,
+            k{K}_ratio_blurfill                                            (Phase 31 headline)
             k{K}_top_conf_drop_zerofill, k{K}_random_conf_drop_zerofill,
             k{K}_ratio_zerofill                                            (legacy fill)
         A faithful explanation shows top_conf_drop >> random_conf_drop.
@@ -380,7 +429,7 @@ class ExplanationMetrics:
         model.eval()
         rng = np.random.default_rng(seed)
 
-        _fills = ("replicate", "zero")
+        _fills = ("replicate", "blur", "zero")
         accum = {(k, f): {"top": [], "rand": []} for k in k_values for f in _fills}
 
         _debug_printed = False   # print diagnostics once for the first batch
@@ -402,8 +451,11 @@ class ExplanationMetrics:
 
                 # Task 1.3 diagnostic: dump raw M_t statistics once (first batch only)
                 if not _debug_printed:
-                    print(f"[DIAG frame_attn_drop] fill protocols: primary=replicate "
-                          f"(Phase 28, freeze-frame), secondary=zero (legacy *_zerofill keys)")
+                    print("[DIAG frame_attn_drop] fill protocols: headline=blur "
+                          "(Phase 31, evidence-destroying, *_blurfill keys), "
+                          "replicate (Phase 28 freeze-frame -- physically ~0 signal "
+                          "on fully-fake redundant clips, continuity only), "
+                          "zero (legacy *_zerofill keys)")
                     print(f"[DIAG frame_attn_drop] M_t shape: {M_t.shape}")
                     print(f"[DIAG frame_attn_drop] M_t mean per frame:\n"
                           f"  {M_t.mean(dim=(-1,-2))}")
@@ -454,6 +506,7 @@ class ExplanationMetrics:
                             accum[(k, fill)]["rand"].append(drop_rand)
 
         result = {}
+        _suffix = {"replicate": "", "blur": "_blurfill", "zero": "_zerofill"}
         for k in k_values:
             for fill in _fills:
                 tops   = accum[(k, fill)]["top"]
@@ -461,7 +514,7 @@ class ExplanationMetrics:
                 t_mean = float(np.mean(tops))  if tops  else 0.0
                 r_mean = float(np.mean(rands)) if rands else 0.0
                 ratio  = t_mean / (r_mean + 1e-8)
-                _sfx = "" if fill == "replicate" else "_zerofill"
+                _sfx = _suffix[fill]
                 result[f"k{k}_top_conf_drop{_sfx}"]    = t_mean
                 result[f"k{k}_random_conf_drop{_sfx}"] = r_mean
                 result[f"k{k}_ratio{_sfx}"]            = ratio

@@ -160,17 +160,24 @@ class EAHNConfig:
                                           # 9 epochs (run 6-12-26 0020hrs): all 12
                                           # slots identical, effective K=1.
     # ── Phase 30: necessity (deletion) pass + bounded temporal band ──────────
-    lambda_del:            float = 0.3    # weight for the deletion loss: classify the
-                                          # INVERSE-bottlenecked input (top-M_t region
-                                          # blurred, rest visible) as REAL.  Trains
-                                          # NECESSITY — all fake evidence must live
-                                          # under the map.  Complements loss_ins
-                                          # (sufficiency).  Run 6-12-26 0020hrs:
-                                          # without it, deletion AUC 0.502 was WORSE
-                                          # than the 0.436 random control.  Alternates
-                                          # with the B-pass (even/odd steps) so the
-                                          # per-step forward count stays at 2.
-                                          # Shares faith_warmup_epochs.  0.0 = off.
+    lambda_del:            float = 0.2    # weight for the deletion (necessity) loss
+                                          # on the INVERSE-bottlenecked input (top-M_t
+                                          # region blurred, rest visible).  Phase 31
+                                          # form: reals → BCE-to-REAL (true label);
+                                          # fakes → hinge relu(logit−del_margin_logit)
+                                          # gated on A-pass detection; plus a full-blur
+                                          # ANCHOR step every del_anchor_every batches.
+                                          # P30 ran 0.3 with BCE-to-0 on ALL samples —
+                                          # certainty-REAL on 96%-visible fakes — and
+                                          # collapsed fake_acc (run 6-12-26 1300hrs).
+                                          # NOTE the hinge is in LOGIT units (~1–3
+                                          # early), so the logged `del=` value is much
+                                          # larger than P30's focal units; per-sample
+                                          # GRADIENT (lambda×1, vanishing at p≤0.5) is
+                                          # comparable.  Alternates with the B-pass
+                                          # (even/odd steps) so the per-step forward
+                                          # count stays at 2.  Shares
+                                          # faith_warmup_epochs.  0.0 = off.
     lambda_temp_band:      float = 0.05   # weight for temporal_band_loss: hinge
                                           # penalty when eff_fr = 1/Σp² exceeds
                                           # temp_band_target.  ZERO gradient below
@@ -181,6 +188,52 @@ class EAHNConfig:
                                           # (of T=16). 6 effective frames keeps the
                                           # top frame at ~17-25% mass — enough for
                                           # measurable k1 drops without one-hot.
+    # ── Phase 31: D-pass detox + spatial band ─────────────────────────────────
+    # Run 6-12-26 1300hrs verdict: every P30 mechanism fired (cbm_div 0.94→0.10,
+    # eff_fr 4.3–4.6, del falling) but detection fell 0.879→0.796 and fake_acc
+    # collapsed (train_clean 0.40, val E4 0.082 at warmup completion).  Root
+    # cause: loss_del demanded CERTAIN-REAL on fakes whose erased footprint was
+    # ~2/49 cells (96% of the face still visible) for HALF of all steps —
+    # systematic "visible fake evidence → REAL" supervision.  Secondary: the
+    # open-ended -peak sparsity reward squeezed eff_sp 3.4 (P29) → 1.8 (P30).
+    del_margin_logit:      float = 0.0    # Phase 31: hinge margin for the fake-side
+                                          # D-loss, relu(logit_D − margin).  0.0 =
+                                          # push p(fake|erased) to ≤0.5 then STOP.
+                                          # The old BCE-to-0 kept pushing toward
+                                          # certainty-REAL, which poisons detection.
+    del_anchor_every:      int   = 8      # Phase 31: every Nth batch the D-pass uses
+                                          # a FULL-blur input (no M_t dependence)
+                                          # with target REAL for all samples — no
+                                          # evidence visible ⇒ REAL is epistemically
+                                          # correct for both classes.  Anchors the
+                                          # blur end of the del/ins eval curves
+                                          # (P30: blurred_conf 0.40 put a floor
+                                          # under deletion AUC).  0 = off.
+    lambda_spatial_band:   float = 0.05   # Phase 31: two-sided hinge on per-frame
+                                          # eff_sp = 1/Σp² over the 49 cells.
+                                          # Replaces lambda_sparse (-peak reward,
+                                          # an open-ended ratchet — same pathology
+                                          # as P27's temporal -max).  0.0 = off.
+    spatial_band_lo:       float = 4.0    # lower edge: penalise eff_sp < 4 cells.
+                                          # P30 collapsed to 1.8 cells → detection
+                                          # starved + insertion ordering carried
+                                          # ~2 cells of signal.  P29 ran at ~3.4.
+    spatial_band_hi:       float = 10.0   # upper edge: penalise eff_sp > 10 cells
+                                          # (keeps the map from re-diffusing to the
+                                          # 17-cell init state; B-pass needs a
+                                          # concentrated keep-region to work).
+    focal_alpha_pos:       float = -1.0   # Phase 31: class-conditional focal alpha
+                                          # for FAKE (label 1) samples.  Negative =
+                                          # disabled → falls back to the legacy
+                                          # global focal_alpha scale.  NOTE: the
+                                          # legacy focal_alpha multiplies BOTH
+                                          # classes equally (pure scale, no class
+                                          # weighting) — fake recall never had a
+                                          # loss-side counterweight.  Run with 1.0.
+    focal_alpha_neg:       float = -1.0   # Phase 31: alpha for REAL (label 0).
+                                          # Run with 0.5 → 2:1 fake:real error
+                                          # weighting at the same mean scale as the
+                                          # legacy 0.75 global multiplier.
     lambda_cbm_main_aux:   float = 0.05   # Phase 27: aux supervision on main_logit
                                           # (NOT in prediction path; just a regulariser
                                           # so we can diagnose whether attn_pool alone
@@ -281,6 +334,17 @@ def parse_args() -> argparse.Namespace:
                         choices=["bce", "focal"])
     parser.add_argument("--focal_alpha", type=float, default=None)
     parser.add_argument("--focal_gamma", type=float, default=None)
+    parser.add_argument("--focal_alpha_pos", type=float, default=None,
+                        help="Phase 31: class-conditional focal alpha for FAKE "
+                             "(label 1). Set together with --focal_alpha_neg; "
+                             "negative/unset = legacy global focal_alpha scale. "
+                             "Run with 1.0 (fake) / 0.5 (real) — 2:1 fake-error "
+                             "weighting at the same mean scale as the legacy "
+                             "0.75 global multiplier (which weighted BOTH "
+                             "classes equally, i.e. no class counterweight).")
+    parser.add_argument("--focal_alpha_neg", type=float, default=None,
+                        help="Phase 31: class-conditional focal alpha for REAL "
+                             "(label 0). See --focal_alpha_pos.")
     parser.add_argument("--grad_accum_steps", type=int, default=None)
     parser.add_argument("--use_amp", dest="use_amp", action="store_true", default=None)
     parser.add_argument("--no_amp", dest="use_amp", action="store_false")
@@ -340,7 +404,10 @@ def parse_args() -> argparse.Namespace:
                              "(focal BCE on bottlenecked logits — re-uses out_B). "
                              "Default 0.5; shares faith_warmup_epochs ramp.")
     parser.add_argument("--lambda_sparse", type=float, default=None,
-                        help="Weight for Phase 21 sparsity (negative peak) loss (default 0.05).")
+                        help="Weight for Phase 21 sparsity (negative peak) loss (default 0.05). "
+                             "Phase 31: superseded by --lambda_spatial_band (bounded two-sided "
+                             "hinge); the -peak form is an open-ended ratchet that squeezed "
+                             "eff_sp to 1.8/49 cells in P30. Keep this at 0.0.")
     parser.add_argument("--faith_warmup_epochs", type=int, default=None,
                         help="Epochs to linearly ramp lambda_faith from 0 (default 3).")
     parser.add_argument("--attn_floor", type=float, default=None,
@@ -373,11 +440,13 @@ def parse_args() -> argparse.Namespace:
                              "by --lambda_temp_band (bounded); keep this at 0.0.")
     # ── Phase 30: necessity pass + bounded temporal band + overlay count ──
     parser.add_argument("--lambda_del", type=float, default=None,
-                        help="Phase 30: weight for the deletion (necessity) loss — "
-                             "the inverse-bottlenecked input (top-M_t region blurred, "
-                             "rest visible) must classify as REAL. Alternates with the "
-                             "B-pass per step; shares faith_warmup_epochs. Default 0.3; "
-                             "0.0 disables (ablation).")
+                        help="Phase 30/31: weight for the deletion (necessity) loss on "
+                             "the inverse-bottlenecked input. Phase 31 form: reals -> "
+                             "BCE-to-REAL (true label); fakes -> hinge "
+                             "relu(logit - del_margin_logit) gated on A-pass detection; "
+                             "full-blur anchor every del_anchor_every batches. Alternates "
+                             "with the B-pass per step; shares faith_warmup_epochs. "
+                             "Default 0.2; 0.0 disables (ablation).")
     parser.add_argument("--lambda_temp_band", type=float, default=None,
                         help="Phase 30: weight for temporal_band_loss — hinge penalty "
                              "when eff_fr=1/sum(p^2) exceeds temp_band_target. Zero "
@@ -389,6 +458,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xai_overlay_videos", type=int, default=None,
                         help="Phase 30: number of XAI overlay videos saved at eval "
                              "(default 50 = 25 real + 25 fake; was 10).")
+    # ── Phase 31: D-pass detox + spatial band ─────────────────────────────
+    parser.add_argument("--del_margin_logit", type=float, default=None,
+                        help="Phase 31: hinge margin for the fake-side D-loss "
+                             "relu(logit_D - margin), applied only to fakes the "
+                             "A-pass currently detects. 0.0 = push p(fake|erased) "
+                             "to 0.5 then stop. (P30's BCE-to-0 on ALL samples "
+                             "pushed toward certainty-REAL on 96%-visible fakes "
+                             "and collapsed fake_acc to 0.40 train / 0.57 test.)")
+    parser.add_argument("--del_anchor_every", type=int, default=None,
+                        help="Phase 31: every Nth batch the D-pass uses a FULL-blur "
+                             "input with target REAL for all samples (no evidence "
+                             "visible => REAL). Anchors the blur end of the del/ins "
+                             "curves. Default 8; 0 disables.")
+    parser.add_argument("--lambda_spatial_band", type=float, default=None,
+                        help="Phase 31: weight for spatial_band_loss — two-sided "
+                             "hinge on per-frame eff_sp=1/sum(p^2) over 49 cells. "
+                             "Replaces --lambda_sparse (open-ended -peak ratchet "
+                             "that squeezed eff_sp to 1.8 cells in P30). Default "
+                             "0.05; 0.0 disables.")
+    parser.add_argument("--spatial_band_lo", type=float, default=None,
+                        help="Phase 31: lower band edge — penalise eff_sp below "
+                             "this many effective cells (default 4.0).")
+    parser.add_argument("--spatial_band_hi", type=float, default=None,
+                        help="Phase 31: upper band edge — penalise eff_sp above "
+                             "this many effective cells (default 10.0).")
     parser.add_argument("--refine_gate_init", type=float, default=None,
                         help="Phase 26: initial value of bidirectional refine_gate parameter. "
                              "alpha = sigmoid(refine_gate_init). Default -0.5 → alpha=0.378 so "

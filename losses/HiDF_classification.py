@@ -31,16 +31,32 @@ class FocalLoss(nn.Module):
     sampler may cause overfitting on the 890 real samples).
     With WeightedRandomSampler active, default to BCE.
 
-    alpha : down-weights the easy-majority-class loss
+    alpha : LEGACY global scale.  NOTE (Phase 31 finding): this multiplies
+            BOTH classes equally — `alpha * (1-pt)^gamma * bce` — so despite
+            the v4 comment "raised to penalise fake misses harder" it never
+            weighted fakes at all; it is a pure scale on the loss.  Two runs
+            of evidence (P29 fake_acc@0.5 = 0.497, P30 = 0.569 while
+            real_acc ≈ 0.86) motivated the class-conditional form below.
+    alpha_pos / alpha_neg : Phase 31 class-conditional weights — alpha_pos
+            multiplies FAKE (label 1) terms, alpha_neg REAL (label 0) terms
+            (the standard Lin et al. alpha_t form, made explicit).  Both
+            must be ≥ 0 to activate; otherwise the legacy global alpha is
+            used, bit-for-bit identical to the old behaviour.
+            Run choice 1.0/0.5: 2:1 fake-error weighting with mean scale
+            0.75 on a balanced batch = unchanged total magnitude vs the
+            legacy global 0.75.
     gamma : focusing parameter — higher = more focus on hard examples
     label_smoothing : maps 0→ε, 1→1-ε before BCE
     """
     def __init__(self, alpha: float = 0.25, gamma: float = 2.0,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.0,
+                 alpha_pos: float = -1.0, alpha_neg: float = -1.0):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.label_smoothing = label_smoothing
+        self.alpha_pos = alpha_pos
+        self.alpha_neg = alpha_neg
 
     def forward(self, logit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target = target.float()
@@ -51,6 +67,17 @@ class FocalLoss(nn.Module):
         prob = torch.sigmoid(logit)
         pt   = torch.where(target >= 0.5, prob, 1 - prob)
 
+        # Phase 31: class-conditional alpha_t when both weights are set;
+        # legacy global scale otherwise (exact back-compat).
+        if self.alpha_pos >= 0.0 and self.alpha_neg >= 0.0:
+            alpha_t = torch.where(
+                target >= 0.5,
+                torch.as_tensor(self.alpha_pos, dtype=prob.dtype, device=prob.device),
+                torch.as_tensor(self.alpha_neg, dtype=prob.dtype, device=prob.device),
+            )
+        else:
+            alpha_t = self.alpha
+
         # Apply label smoothing to the BCE target only
         if self.label_smoothing > 0:
             smooth_target = target * (1.0 - 2 * self.label_smoothing) + self.label_smoothing
@@ -58,7 +85,7 @@ class FocalLoss(nn.Module):
             smooth_target = target
 
         bce   = F.binary_cross_entropy_with_logits(logit, smooth_target, reduction='none')
-        focal = self.alpha * (1 - pt).pow(self.gamma) * bce
+        focal = alpha_t * (1 - pt).pow(self.gamma) * bce
         return focal.mean()
 
 
@@ -70,5 +97,7 @@ def build_classification_loss(config) -> nn.Module:
             alpha=getattr(config, "focal_alpha", 0.25),
             gamma=getattr(config, "focal_gamma", 2.0),
             label_smoothing=ls,
+            alpha_pos=float(getattr(config, "focal_alpha_pos", -1.0)),
+            alpha_neg=float(getattr(config, "focal_alpha_neg", -1.0)),
         )
     return ClassificationLoss(label_smoothing=ls)

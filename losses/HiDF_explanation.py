@@ -302,7 +302,14 @@ def faithfulness_loss(logits_A: torch.Tensor,
 
 
 def sparsity_loss(M_t: torch.Tensor) -> torch.Tensor:
-    """Negative mean peak-energy per (b, t) frame."""
+    """Negative mean peak-energy per (b, t) frame.
+
+    Phase 31: SUPERSEDED by spatial_band_loss — this is an open-ended
+    reward (-max keeps paying all the way to one-hot), the same ratchet
+    pathology as temporal_sparsity_loss on the temporal axis.  It squeezed
+    eff_sp from 3.4 (P29) to 1.8/49 cells (P30) and starved detection.
+    Kept for ablation history; run with lambda_sparse=0.0.
+    """
     return -M_t.amax(dim=(-2, -1)).mean()
 
 
@@ -374,3 +381,62 @@ def temporal_band_loss(M_frame: torch.Tensor, target_eff: float = 6.0) -> torch.
     eff = 1.0 / M_frame.pow(2).sum(dim=-1).clamp(min=1e-12)     # (B,)
     scale = max(float(T) - float(target_eff), 1.0)
     return F.relu(eff - float(target_eff)).mean() / scale
+
+
+def spatial_band_loss(M_t: torch.Tensor,
+                      lo: float = 4.0,
+                      hi: float = 10.0) -> torch.Tensor:
+    """Phase 31: BOUNDED two-sided spatial-footprint penalty on M_t.
+
+    Per (b, t) frame: eff_sp = 1 / Σ_cells p²  (inverse Herfindahl over the
+    N=h*w softmax cells — "effective cell count"; uniform → N, one-hot → 1).
+
+        loss = relu(eff_sp - hi) / (N - hi)     too diffuse
+             + relu(lo - eff_sp) / lo           too concentrated
+        averaged over (B, T).  Zero everywhere inside [lo, hi].
+
+    Why this replaces sparsity_loss (-peak): the -max form is an OPEN-ENDED
+    reward — exactly the pathology that drove M_frame to 99.998% one-hot in
+    P27 on the temporal axis.  On the spatial axis it squeezed eff_sp from
+    3.4 (P29, detection 0.879) to 1.8 cells (P30 run 6-12-26 1300hrs,
+    detection 0.796): the classifier was starved down to ~2 of 49 cells per
+    frame, and the insertion metric's pixel ordering carried ~2 cells of
+    signal before degenerating to a random tail (ins_gain_over_random
+    -0.061).  The B/D bottleneck passes add their own concentration
+    pressure, so without a lower hinge there is nothing to stop the
+    collapse.
+
+    Interplay with bottleneck_peak_floor=0.25: a map with eff_sp ≈ 4–5 can
+    still hold its peak ≥ 0.25 (e.g. {0.3, 0.25, 0.2, 0.15, 0.1} → eff 4.4),
+    so the band does not fight the B-pass floor.
+
+    M_t : (B, T, h, w) softmax over the h*w cells per frame.
+    """
+    B, T = M_t.shape[0], M_t.shape[1]
+    N = M_t.shape[-2] * M_t.shape[-1]
+    p = M_t.reshape(B, T, N)
+    eff = 1.0 / p.pow(2).sum(dim=-1).clamp(min=1e-12)           # (B, T)
+    hi_scale = max(float(N) - float(hi), 1.0)
+    lo_scale = max(float(lo), 1.0)
+    too_diffuse      = F.relu(eff - float(hi)) / hi_scale
+    too_concentrated = F.relu(float(lo) - eff) / lo_scale
+    return (too_diffuse + too_concentrated).mean()
+
+
+def full_blur_input(x: torch.Tensor,
+                    blur_kernel: int = 21,
+                    blur_sigma: float = 10.0) -> torch.Tensor:
+    """Phase 31: fully-blurred clip for the D-pass ANCHOR step.
+
+    Returns gauss_blur(x) with NO dependence on M_t — used every
+    del_anchor_every-th batch with target REAL for all samples.  A fully
+    blurred clip contains no manipulation evidence by construction, so
+    "REAL" is the epistemically correct label for both classes; this
+    teaches the model the blur-end anchor of the deletion/insertion curves
+    without ever pairing VISIBLE evidence with a REAL label (the P30
+    poisoning).  Run 6-12-26 1300hrs: blurred_conf was 0.40, which put a
+    hard floor under deletion AUC (del_at_100pct = 0.386) regardless of
+    map quality.
+    """
+    with torch.no_grad():
+        return _gaussian_blur_5d(x.detach(), blur_kernel, blur_sigma)
