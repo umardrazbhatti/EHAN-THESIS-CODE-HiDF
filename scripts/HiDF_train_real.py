@@ -398,6 +398,7 @@ def main(config: EAHNConfig):
                     and float(getattr(config, "lambda_del", 0.0)) > 0.0
                     and (batch_idx % 2 == 1)
                 )
+                _ins_frac = 0.0   # Phase 32: per-B-step hard keep fraction (set in B-pass)
                 if config.phase21_enabled and not _is_del_step:
                     # ── Pass B: bottlenecked input — gradient ENABLED ─────────
                     # v2 FIX: no_grad REMOVED here.
@@ -410,14 +411,29 @@ def main(config: EAHNConfig):
                     # Memory note: storing B-pass activations costs ~same as A-pass.
                     # With batch_size=2, grad_accum=2 this is fine on T4 (8GB).
                     # If OOM occurs, reduce batch_size or increase grad_accum_steps.
+                    # ── Phase 32: B-pass sufficiency hard-mask ────────────────
+                    # Sample the keep fraction per B-step in [lo, hi] so loss_ins
+                    # trains the insertion metric's HARD top-k pixel reveal across
+                    # the steep low-reveal range, not a single point.  lo=hi=0 =
+                    # P31 soft behaviour (peak_floor path).  The D-pass below uses
+                    # bottleneck_hard_topk_frac (0.0 = soft), so the met deletion
+                    # number is structurally untouched by this axis.
+                    _ins_lo = float(getattr(config, "ins_hard_topk_frac_lo", 0.0))
+                    _ins_hi = float(getattr(config, "ins_hard_topk_frac_hi", 0.0))
+                    if _ins_hi > 0.0:
+                        _lo_c     = min(max(_ins_lo, 1e-3), _ins_hi)
+                        _ins_frac = float(
+                            torch.empty(1, device=frames.device)
+                            .uniform_(_lo_c, _ins_hi).item()
+                        )
+                    else:
+                        _ins_frac = 0.0
                     x_b = build_bottlenecked_input(
                         frames, M_t,
                         blur_kernel=config.blur_kernel,
                         blur_sigma=config.blur_sigma,
-                        peak_floor=config.bottleneck_peak_floor,        # Phase 22: fixed floor
-                        hard_topk_frac=float(getattr(
-                            config, "bottleneck_hard_topk_frac", 0.0
-                        )),                                             # Phase 25: HARD top-K binary mask
+                        peak_floor=config.bottleneck_peak_floor,        # Phase 22 (soft path only)
+                        hard_topk_frac=_ins_frac,                       # Phase 32: B-pass hard top-K
                     )
                     out_B       = model(x_b)           # GRAD ENABLED (v2 fix)
                     loss_faith  = faithfulness_loss(logits_A, out_B.logit)
@@ -907,6 +923,27 @@ def main(config: EAHNConfig):
                           "lambda_spatial_band are active — the -peak ratchet "
                           "will fight the band's lower hinge; set "
                           "--lambda_sparse 0.0.")
+                # Phase 32: B-pass sufficiency hard-mask diagnostic.
+                #   When hi>0 the B-pass keeps EXACTLY the top-k% pixels (hard STE
+                #   mask) and blurs the rest — the same construction the insertion
+                #   metric uses at eval.  L_ins should rise vs P31 first (the model
+                #   now must call the class from a small region) then FALL across
+                #   epochs as M_t learns to put SUFFICIENT evidence in its top
+                #   cells.  The D-pass stays soft, so deletion (0.224 in P31) is
+                #   protected.  Watch next run: ins_gain_over_random crossing 0,
+                #   insertion_auc_fake_only rising from 0.388, faith corr from 0.318.
+                _ins_lo_d = float(getattr(config, "ins_hard_topk_frac_lo", 0.0))
+                _ins_hi_d = float(getattr(config, "ins_hard_topk_frac_hi", 0.0))
+                _Hd, _Wd  = frames.shape[3], frames.shape[4]
+                _kpx      = int(_ins_frac * _Hd * _Wd) if _ins_frac > 0 else 0
+                print(f"[DIAG-P32] ins_hard_topk=[{_ins_lo_d},{_ins_hi_d}]  "
+                      f"sampled_frac={_ins_frac:.3f}  "
+                      f"K_px={_kpx}/{_Hd * _Wd}  "
+                      f"L_ins={loss_ins.item():.4f}  "
+                      f"(B-pass hard sufficiency; D-pass soft = deletion protected)")
+                if _ins_hi_d <= 0.0:
+                    print("[DIAG-P32] ins_hard_topk OFF (lo=hi=0) — soft B-pass "
+                          "(P31 behaviour); insertion train/eval still misaligned.")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:

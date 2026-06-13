@@ -110,6 +110,22 @@ class EAHNConfig:
                                              # soft blur.  K = frac * H * W (typical 0.20 → keep 20% of pixels).
                                              # Aligns loss_ins / loss_faith with the insertion AUC metric.
                                              # Set 0.0 to revert to Phase 22/24 soft blending.
+    # ── Phase 32: B-pass sufficiency hard-mask (insertion alignment) ──────────
+    # P31 verdict (run 6-13-26 0900hrs): detection FIXED (AUC 0.9115) and
+    # necessity FIXED (deletion 0.224, del_gain +0.285 on EVERY sample), but the
+    # insertion ordering still LOSES to random (ins_gain -0.216) and faith corr
+    # stalled at 0.318.  Root cause: loss_ins trained on the SOFT bottleneck
+    # (peak_floor path keeps the whole region at low contrast) while the
+    # insertion metric does a HARD top-k pixel reveal on a blur canvas — the
+    # model was never trained on what it is tested on.  These fields turn ON a
+    # hard top-K binary keep-mask (straight-through estimator) for the B-pass
+    # ONLY; the D-pass keeps using bottleneck_hard_topk_frac (0.0 = soft) so the
+    # already-met deletion number is structurally untouched.  Each B-step samples
+    # frac ~ U[lo, hi] so loss_ins trains the steep low-reveal span of the
+    # insertion curve (the 10%/25% checkpoints) rather than a single point.
+    # lo=hi=0.0 = P31 soft behaviour (full back-compat).
+    ins_hard_topk_frac_lo: float = 0.0   # lower edge of the per-B-step keep fraction
+    ins_hard_topk_frac_hi: float = 0.0   # upper edge; 0.0 = OFF (soft B-pass, P31)
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -424,7 +440,18 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 25: when > 0 (typical 0.20), bottleneck uses a HARD top-K binary "
                              "mask via straight-through estimator instead of the soft blur. Aligns "
                              "loss_ins / loss_faith training signal with the insertion-AUC metric. "
-                             "Set 0.0 to revert to Phase 22/24 soft behaviour.")
+                             "Set 0.0 to revert to Phase 22/24 soft behaviour. "
+                             "Phase 32: this controls the D-pass only; use "
+                             "--ins_hard_topk_frac_lo/hi for the B-pass.")
+    parser.add_argument("--ins_hard_topk_frac_lo", type=float, default=None,
+                        help="Phase 32: lower edge of the B-pass sufficiency hard "
+                             "top-K keep fraction (sampled U[lo,hi] per B-step). "
+                             "Trains loss_ins/loss_faith on the insertion metric's "
+                             "HARD pixel reveal. lo=hi=0.0 = soft B-pass (P31).")
+    parser.add_argument("--ins_hard_topk_frac_hi", type=float, default=None,
+                        help="Phase 32: upper edge of the B-pass sufficiency hard "
+                             "top-K keep fraction. Typical 0.25. The D-pass "
+                             "(deletion) stays soft and is unaffected.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "
