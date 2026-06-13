@@ -157,24 +157,41 @@ def main(config: EAHNConfig):
     print(f"[DataLoader val] batch_size={config.batch_size}  shuffle=False  size={len(val_ds)}")
 
     # ── Smoke check ───────────────────────────────────────────────────────────
+    # Confirms the split + collate actually yield BOTH classes.  Scans up to
+    # _smoke_max batches and STOPS as soon as both are seen.  The old version
+    # inspected exactly 3 batches (6 samples) and hard-asserted — but at the
+    # HiDF 0.9:1 ratio a single-class draw of 6 samples is just an unlucky
+    # shuffle (P ~ 0.476^6 ~ 1.2%), NOT a broken loader, and must never kill an
+    # 11h run (it did on Exp3 of the 3-account sweep while Exp1/Exp2 drew lucky).
+    # A genuinely broken split stays single-class across ALL _smoke_max batches
+    # (P ~ 0.476^50 ~ 1e-16 for the real check), which still trips the assert.
+    # Seeded so the draw is reproducible across runs (no more flaky gate).
+    _smoke_gen = torch.Generator()
+    _smoke_gen.manual_seed(1234)
     _smoke_loader = DataLoader(
         train_ds, batch_size=config.batch_size, shuffle=True,
-        collate_fn=deepfake_collate_fn, num_workers=0,
+        collate_fn=deepfake_collate_fn, num_workers=0, generator=_smoke_gen,
     )
     _saw_real = _saw_fake = False
+    _smoke_max = 25
+    _i = -1
     for _i, _sb in enumerate(iter(_smoke_loader)):
         _bl = _sb["label"].cpu().numpy().astype(int)
         _r, _f = int((_bl == 0).sum()), int((_bl == 1).sum())
         print(f"[Smoke] Batch {_i}: real={_r} fake={_f}")
         if _r > 0: _saw_real = True
         if _f > 0: _saw_fake = True
-        if _i == 2: break
+        if _saw_real and _saw_fake:
+            break
+        if _i + 1 >= _smoke_max:
+            break
     del _smoke_loader
     assert _saw_real and _saw_fake, (
-        "All 3 inspected batches are single-class. Split or DataLoader broken — "
-        "check DeepfakeDataset._split()."
+        f"No mixed-class batch in {_i + 1} inspected batches "
+        f"(batch_size={config.batch_size}). Split or DataLoader genuinely "
+        f"broken — check DeepfakeDataset._split()."
     )
-    print("[Smoke] Both classes seen across 3 batches — Regime A loader OK.")
+    print(f"[Smoke] Both classes seen by batch {_i} — Regime A loader OK.")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EAHN(config).to(device)
