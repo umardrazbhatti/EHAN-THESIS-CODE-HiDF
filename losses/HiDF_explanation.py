@@ -457,7 +457,13 @@ def localization_loss(M_t: torch.Tensor,
     tgt = torch.where(tgt_sum > 1e-8, tgt / tgt_sum.clamp(min=1e-8), uniform)  # (B, h*w)
     log_M = M_t.reshape(B, T, h * w).clamp(min=1e-8).log()                    # (B,T,h*w)
     ce = -(tgt.unsqueeze(1) * log_M).sum(dim=-1)                              # (B, T)
-    return ce.mean()
+    # Normalise by log(N) so the loss is unit-scaled (uniform M_t -> ~1.0,
+    # perfectly on-boundary -> ~0).  Without this the raw CE starts near
+    # log(49)=3.9 -- an order of magnitude above the other loss terms -- and
+    # with clip_grad_norm=1.0 it would dominate the clipped gradient budget and
+    # throttle detection learning.  Unit scale makes lambda_localize directly
+    # comparable to lambda_faith / lambda_ins.
+    return ce.mean() / _math.log(float(h * w))
 
 
 def full_blur_input(x: torch.Tensor,
