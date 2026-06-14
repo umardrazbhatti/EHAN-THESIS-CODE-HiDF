@@ -423,6 +423,43 @@ def spatial_band_loss(M_t: torch.Tensor,
     return (too_diffuse + too_concentrated).mean()
 
 
+def localization_loss(M_t: torch.Tensor,
+                      boundary: torch.Tensor) -> torch.Tensor:
+    """Phase 33: pull the intrinsic attention M_t onto the self-blend seam.
+
+    This is the direct fix for the insertion wall.  Runs 6-13/6-14 proved the
+    detector's evidence is HOLISTIC: deleting the attended region crashes
+    fake-confidence (necessity) but revealing it on a blur canvas does not
+    restore it (sufficiency), so insertion loses to random for ANY compact map.
+    A self-blended pseudo-fake (data.HiDF_self_blend.make_sbi_batch) has a
+    LOCAL, causal artifact -- the blend boundary -- which IS sufficient.  Pull
+    M_t onto that boundary and the attended region becomes sufficient too, so
+    insertion in attention order recovers confidence fast (and faithfulness
+    rises because gradient and attention now agree on the seam).
+
+    M_t      : (B, T, h, w) softmax over the h*w cells per frame.
+    boundary : (B, 1, H, W) non-negative seam-energy map (peaks at the blend
+               boundary).  Downsampled to (h, w) by average pooling and
+               normalised per sample to a target distribution.
+
+    Loss = soft cross-entropy CE(target, M_t) averaged over (B, T):
+        -sum_cells target * log(M_t)
+    Minimised when M_t puts its mass on the boundary cells.  Gradient flows
+    M_t -> EarlyAttnHead / refinement gate, so the attention head learns to
+    seek blend seams.  Samples whose boundary is empty (no seam) contribute a
+    uniform target (a no-op pull), so the term is always finite.
+    """
+    B, T, h, w = M_t.shape
+    tgt = F.adaptive_avg_pool2d(boundary.float(), (h, w)).reshape(B, h * w)  # (B, h*w)
+    tgt_sum = tgt.sum(dim=-1, keepdim=True)
+    # Empty-boundary guard: fall back to uniform target (no directional pull).
+    uniform = torch.full_like(tgt, 1.0 / float(h * w))
+    tgt = torch.where(tgt_sum > 1e-8, tgt / tgt_sum.clamp(min=1e-8), uniform)  # (B, h*w)
+    log_M = M_t.reshape(B, T, h * w).clamp(min=1e-8).log()                    # (B,T,h*w)
+    ce = -(tgt.unsqueeze(1) * log_M).sum(dim=-1)                              # (B, T)
+    return ce.mean()
+
+
 def full_blur_input(x: torch.Tensor,
                     blur_kernel: int = 21,
                     blur_sigma: float = 10.0) -> torch.Tensor:

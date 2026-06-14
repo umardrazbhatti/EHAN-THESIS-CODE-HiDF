@@ -126,6 +126,27 @@ class EAHNConfig:
     # lo=hi=0.0 = P31 soft behaviour (full back-compat).
     ins_hard_topk_frac_lo: float = 0.0   # lower edge of the per-B-step keep fraction
     ins_hard_topk_frac_hi: float = 0.0   # upper edge; 0.0 = OFF (soft B-pass, P31)
+    # ── Phase 33: self-blended images (SBI) + boundary-supervised attention ──
+    # Root-cause fix for the insertion wall (proven runs 6-13/6-14): the
+    # detector's fake-evidence is HOLISTIC -- deleting the attended region
+    # crashes fake-conf (necessity) but revealing it on a blur canvas does NOT
+    # restore conf (sufficiency), so insertion structurally loses to random for
+    # any compact map.  Each optimizer step a small batch of REAL clips is
+    # self-blended on-GPU (data.HiDF_self_blend) into pseudo-fakes with a KNOWN
+    # blend boundary; the model is trained to classify them fake (lambda_sbi_cls)
+    # AND to align its attention M_t to the boundary (lambda_localize).  The
+    # boundary is a LOCAL sufficient artifact, so insertion in attention order
+    # recovers conf fast; self-blends are also the SOTA cross-dataset cue.  The
+    # A/B/D detection regime is UNTOUCHED (bounded additive aux pass once per
+    # optimizer step), so the met detection/deletion numbers are protected.
+    # sbi_enabled=False = exact Phase 32 behaviour (full back-compat).
+    sbi_enabled:       bool  = False   # master switch (Phase 33)
+    lambda_localize:   float = 0.0     # weight on the boundary-attention loss (SWEEP axis)
+    lambda_sbi_cls:    float = 0.5     # weight on the SBI fake-classification aux loss
+    sbi_blend_lo:      float = 0.25    # min ellipse semi-axis (fraction of half-extent)
+    sbi_blend_hi:      float = 0.55    # max ellipse semi-axis
+    sbi_stride:        int   = 8       # run the SBI aux pass every N micro-batches
+                                       # (8 = once per optimizer step at grad_accum=8)
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -452,6 +473,29 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 32: upper edge of the B-pass sufficiency hard "
                              "top-K keep fraction. Typical 0.25. The D-pass "
                              "(deletion) stays soft and is unaffected.")
+    # ── Phase 33: SBI self-blend + boundary-supervised attention ──────────────
+    parser.add_argument("--sbi_enabled", dest="sbi_enabled",
+                        action="store_true", default=None,
+                        help="Phase 33: enable online self-blended pseudo-fakes with "
+                             "blend-boundary attention supervision (local-evidence fix "
+                             "for the insertion wall). Bounded additive aux pass; the "
+                             "A/B/D detection regime is untouched. OFF = Phase 32.")
+    parser.add_argument("--lambda_localize", type=float, default=None,
+                        help="Phase 33: weight on the boundary-attention loss (pulls "
+                             "M_t onto the self-blend seam). This is the sweep axis. "
+                             "Typical 0.5-2.0. Requires --sbi_enabled.")
+    parser.add_argument("--lambda_sbi_cls", type=float, default=None,
+                        help="Phase 33: weight on the SBI fake-classification aux loss "
+                             "(teaches the blend cue; helps cross-dataset). Default 0.5.")
+    parser.add_argument("--sbi_blend_lo", type=float, default=None,
+                        help="Phase 33: min self-blend ellipse semi-axis (fraction of "
+                             "half-extent). Default 0.25.")
+    parser.add_argument("--sbi_blend_hi", type=float, default=None,
+                        help="Phase 33: max self-blend ellipse semi-axis. Default 0.55.")
+    parser.add_argument("--sbi_stride", type=int, default=None,
+                        help="Phase 33: run the SBI aux pass every N micro-batches "
+                             "(8 = once per optimizer step at grad_accum=8). Lower = "
+                             "stronger localization signal but more compute.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

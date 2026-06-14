@@ -49,7 +49,9 @@ from losses.HiDF_explanation import (
     spatial_band_loss,            # Phase 31: bounded two-sided hinge on eff_sp (replaces -peak)
     full_blur_input,              # Phase 31: D-pass anchor step (full blur, no M_t dependence)
     cbm_diversity_loss,           # Phase 26: slot diversity (re-export wrapper)
+    localization_loss,            # Phase 33: pull M_t onto the self-blend boundary
 )
+from data.HiDF_self_blend import make_sbi_batch   # Phase 33: online self-blend generator
 from losses.HiDF_temporal import TemporalConsistencyLoss
 from metrics.HiDF_detection import DetectionMetrics
 from utils.HiDF_checkpointing import save_checkpoint, load_checkpoint
@@ -252,6 +254,23 @@ def main(config: EAHNConfig):
     peak_spread_fn = HardAttentionDiversityLoss(temperature=0.05)
     print(f"[HardAttentionDiversityLoss] lambda_peak_spread={_lambda_peak_spread}")
 
+    # ── Phase 33: self-blend (SBI) + boundary-supervised attention ────────────
+    # Bounded additive aux pass (once per optimizer step) -- does NOT touch the
+    # A/B/D detection regime, so met detection/deletion are protected.  The
+    # localization term is the sweep axis across the 3 accounts.
+    _sbi_enabled     = bool(getattr(config, "sbi_enabled", False))
+    _lambda_localize = float(getattr(config, "lambda_localize", 0.0))
+    _lambda_sbi_cls  = float(getattr(config, "lambda_sbi_cls", 0.5))
+    _sbi_lo          = float(getattr(config, "sbi_blend_lo", 0.25))
+    _sbi_hi          = float(getattr(config, "sbi_blend_hi", 0.55))
+    _sbi_stride      = max(int(getattr(config, "sbi_stride", 8)), 1)
+    _sbi_active      = _sbi_enabled and _lambda_localize > 0.0
+    print(
+        f"[Phase33] sbi_enabled={_sbi_enabled}  lambda_localize={_lambda_localize}  "
+        f"lambda_sbi_cls={_lambda_sbi_cls}  blend=[{_sbi_lo},{_sbi_hi}]  "
+        f"stride={_sbi_stride}  active={_sbi_active}"
+    )
+
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
     _lambda_sharp = float(getattr(config, "lambda_sharp", 0.15))
@@ -358,6 +377,7 @@ def main(config: EAHNConfig):
             "domain": 0.0, "domain_acc": 0.0,             # Phase 27
             "eff_frames": 0.0, "eff_spatial": 0.0,        # Phase 29
             "slot_on_top": 0.0,                           # Phase 29
+            "localize": 0.0, "sbi_cls": 0.0, "n_sbi": 0,  # Phase 33
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
             "n_b": 0, "n_d": 0,                           # Phase 30: pass counts
         }
@@ -766,6 +786,48 @@ def main(config: EAHNConfig):
 
             scaler.scale(loss).backward()
 
+            # ── Phase 33: self-blend + boundary-supervised attention (aux) ─────
+            # Runs AFTER the main backward so the A/B/D graphs are already freed
+            # -- the SBI forward graph never coexists with them, so peak VRAM
+            # stays at the A+B level (no OOM cost on the T4).  Bounded to once per
+            # optimizer step (batch_idx % stride); its gradient accumulates into
+            # the SAME optimizer step (no /grad_accum, so lambda_localize lands at
+            # full per-step weight).  The A/B/D detection regime is UNTOUCHED, so
+            # the met detection/deletion numbers are structurally protected.
+            # Generation is fp32 (autocast off) so grid_sample/affine_grid are
+            # stable; the model forward re-enters autocast.
+            loss_sbi_cls  = torch.zeros((), device=frames.device)
+            loss_localize = torch.zeros((), device=frames.device)
+            _sbi_ran = False
+            _sbi_n   = 0
+            if _sbi_active and (batch_idx % _sbi_stride == 0):
+                _real_sel = (labels.reshape(-1) < 0.5)
+                if bool(_real_sel.any()):
+                    with autocast(_dev_str, enabled=False):
+                        _sbi_frames, _sbi_boundary = make_sbi_batch(
+                            frames[_real_sel].float(),
+                            blend_lo=_sbi_lo, blend_hi=_sbi_hi,
+                        )
+                    with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
+                        out_sbi       = model(_sbi_frames)
+                        _sbi_lbl      = torch.ones(
+                            _sbi_frames.shape[0], device=frames.device
+                        )
+                        loss_sbi_cls  = cls_loss_fn(out_sbi.logit, _sbi_lbl)
+                        loss_localize = localization_loss(out_sbi.M_t, _sbi_boundary)
+                        _lam_loc_eff  = _faith_warmup(
+                            epoch, config.faith_warmup_epochs, _lambda_localize
+                        )
+                        sbi_total = (_lam_loc_eff * loss_localize
+                                     + _lambda_sbi_cls * loss_sbi_cls)
+                    if torch.isfinite(sbi_total):
+                        scaler.scale(sbi_total).backward()
+                        _sbi_ran = True
+                        _sbi_n   = int(_sbi_frames.shape[0])
+                    else:
+                        print(f"[NaNGuard-P33] non-finite SBI loss at epoch={epoch} "
+                              f"batch={batch_idx} — skipped.")
+
             if (batch_idx + 1) % config.grad_accum_steps == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
@@ -961,6 +1023,22 @@ def main(config: EAHNConfig):
                 if _ins_hi_d <= 0.0:
                     print("[DIAG-P32] ins_hard_topk OFF (lo=hi=0) — soft B-pass "
                           "(P31 behaviour); insertion train/eval still misaligned.")
+                # Phase 33: self-blend boundary-supervision diagnostic.  L_localize
+                # is the soft cross-entropy of M_t against the blend seam: it
+                # starts near log(49)=3.9 (uniform attention) and should FALL
+                # across epochs as M_t learns to sit on the boundary -- that is
+                # the mechanism that makes the attended region SUFFICIENT, so
+                # watch ins_gain_over_random crossing 0 and faith corr rising.
+                if _sbi_active:
+                    print(f"[DIAG-P33] sbi=ON  lambda_localize={_lambda_localize}  "
+                          f"lambda_sbi_cls={_lambda_sbi_cls}  stride={_sbi_stride}  "
+                          f"blend=[{_sbi_lo},{_sbi_hi}]  sbi_n={_sbi_n}  "
+                          f"L_sbi_cls={loss_sbi_cls.item():.4f}  "
+                          f"L_localize={loss_localize.item():.4f}  "
+                          f"(boundary-supervised attention; A/B/D regime untouched)")
+                else:
+                    print("[DIAG-P33] sbi=OFF (Phase 32 behaviour) -- insertion "
+                          "stays holistic-limited (deletion necessary, not sufficient).")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -1065,6 +1143,10 @@ def main(config: EAHNConfig):
                 epoch_acc["n_d"] += 1
             else:
                 epoch_acc["n_b"] += 1
+            if _sbi_ran:                                                     # Phase 33
+                epoch_acc["localize"] += loss_localize.item()
+                epoch_acc["sbi_cls"]  += loss_sbi_cls.item()
+                epoch_acc["n_sbi"]    += 1
 
             # ── Rolling log ───────────────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0 or (batch_idx + 1) == total_batches:
@@ -1129,6 +1211,15 @@ def main(config: EAHNConfig):
         # average each over its own pass count.
         n_b = max(epoch_acc["n_b"], 1)
         n_d = max(epoch_acc["n_d"], 1)
+        # Phase 33: report mean boundary-localization loss for the epoch.  It
+        # should FALL across epochs (M_t learning to sit on the self-blend seam),
+        # which is the mechanism behind insertion crossing random + faith rising.
+        if _sbi_active:
+            _nsbi = max(epoch_acc["n_sbi"], 1)
+            print(f"[P33] epoch={epoch}  "
+                  f"mean_L_localize={epoch_acc['localize'] / _nsbi:.4f}  "
+                  f"mean_L_sbi_cls={epoch_acc['sbi_cls'] / _nsbi:.4f}  "
+                  f"sbi_passes={epoch_acc['n_sbi']}")
         history["epoch"].append(epoch)
         history["train_total"].append(epoch_acc["total"]       / n)
         history["train_cls"].append(epoch_acc["cls"]           / n)
