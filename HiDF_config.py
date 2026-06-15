@@ -147,6 +147,22 @@ class EAHNConfig:
     sbi_blend_hi:      float = 0.55    # max ellipse semi-axis
     sbi_stride:        int   = 8       # run the SBI aux pass every N micro-batches
                                        # (8 = once per optimizer step at grad_accum=8)
+    # ── Phase 34: hard spatial top-k attention bottleneck (insertion fix) ─────
+    # P33 verdict (run 6-15-26): SBI fake-classification gave best-ever detection
+    # (0.971) but seam-localization did NOT make HiDF insertion beat random
+    # (ins_gain still negative, WORSE as lambda_localize rose) — the SBI seam
+    # location != the holistic HiDF evidence location.  The map is near-uniform
+    # (m_t_std 0.03) and the model average-pools, so NO compact map can be
+    # "sufficient" (insertion's exact test) by tuning.  Architectural fix: at the
+    # M_t spatial-pool step keep ONLY the top `spatial_topk_frac` of the 49 cells
+    # (straight-through estimator + convex renormalisation -> magnitude preserved,
+    # the Phase 28 anti-starvation lesson).  The prediction is FORCED through a
+    # compact region, so the model concentrates real evidence into the kept cells
+    # -> revealing them (insertion) beats random and faithfulness rises.  Lives in
+    # EAHN.forward, so it applies identically at train AND eval.  Funded by the
+    # P33 detection surplus (0.971 vs 0.92 target).  0.0 or >=1.0 = OFF (exact
+    # Phase 33, full back-compat).  This is the single Phase-34 sweep axis.
+    spatial_topk_frac: float = 0.0     # keep fraction of the 49 spatial cells (SWEEP axis)
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -496,6 +512,15 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 33: run the SBI aux pass every N micro-batches "
                              "(8 = once per optimizer step at grad_accum=8). Lower = "
                              "stronger localization signal but more compute.")
+    # ── Phase 34: hard spatial top-k attention bottleneck ─────────────────────
+    parser.add_argument("--spatial_topk_frac", type=float, default=None,
+                        help="Phase 34: hard spatial attention bottleneck. At the "
+                             "M_t pooling step, keep ONLY the top fraction of the 49 "
+                             "spatial cells (straight-through estimator + convex "
+                             "renormalisation) so the prediction is forced through a "
+                             "compact region and insertion can beat random. Typical "
+                             "0.25-0.50. 0.0 or >=1.0 = OFF (Phase 33 behaviour). "
+                             "Applies at train AND eval. Single Phase-34 sweep axis.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

@@ -271,6 +271,19 @@ def main(config: EAHNConfig):
         f"stride={_sbi_stride}  active={_sbi_active}"
     )
 
+    # ── Phase 34: hard spatial top-k attention bottleneck ─────────────────────
+    # Architectural fix for the insertion wall: the model's prediction is funnelled
+    # through the top `spatial_topk_frac` of M_t's 49 cells (see EAHN.forward).
+    # Lives in the model, so no per-step wiring here -- this just reports config
+    # and computes the keep-cell count for the diagnostics.  0.0 = OFF (Phase 33).
+    _spatial_topk        = float(getattr(config, "spatial_topk_frac", 0.0))
+    _spatial_topk_active = 0.0 < _spatial_topk < 1.0
+    _spatial_topk_k      = max(1, int(math.ceil(_spatial_topk * model.N))) if _spatial_topk_active else model.N
+    print(
+        f"[Phase34] spatial_topk_frac={_spatial_topk}  active={_spatial_topk_active}  "
+        f"keep_cells={_spatial_topk_k}/{model.N}  (insertion bottleneck; STE + convex renorm)"
+    )
+
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
     _lambda_sharp = float(getattr(config, "lambda_sharp", 0.15))
@@ -378,6 +391,7 @@ def main(config: EAHNConfig):
             "eff_frames": 0.0, "eff_spatial": 0.0,        # Phase 29
             "slot_on_top": 0.0,                           # Phase 29
             "localize": 0.0, "sbi_cls": 0.0, "n_sbi": 0,  # Phase 33
+            "kept_mass": 0.0,                             # Phase 34
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
             "n_b": 0, "n_d": 0,                           # Phase 30: pass counts
         }
@@ -1039,6 +1053,21 @@ def main(config: EAHNConfig):
                 else:
                     print("[DIAG-P33] sbi=OFF (Phase 32 behaviour) -- insertion "
                           "stays holistic-limited (deletion necessary, not sufficient).")
+                # Phase 34: spatial bottleneck diagnostic.  kept_mass = the soft
+                # probability mass already sitting on the kept top-k cells; it
+                # starts low (~k/N at uniform init) and should RISE toward 1.0 as
+                # M_t concentrates real evidence into the cells the bottleneck
+                # keeps -- that concentration is what makes the attended region
+                # SUFFICIENT, so watch ins_gain_over_random crossing 0 and faith
+                # corr rising while detection holds (funded by the P33 surplus).
+                if _spatial_topk_active:
+                    print(f"[DIAG-P34] spatial_topk=ON  frac={_spatial_topk}  "
+                          f"keep_cells={_spatial_topk_k}/{model.N}  "
+                          f"kept_mass={float(out_A.spatial_kept_mass):.4f}  "
+                          f"(prediction funnelled through top-k cells; STE + convex renorm)")
+                else:
+                    print("[DIAG-P34] spatial_topk=OFF (frac=0) -- pooling over all "
+                          "cells (Phase 33 behaviour); insertion stays holistic-limited.")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -1136,6 +1165,7 @@ def main(config: EAHNConfig):
             epoch_acc["eff_frames"]  += _eff_fr                             # Phase 29
             epoch_acc["eff_spatial"] += _eff_sp                             # Phase 29
             epoch_acc["slot_on_top"] += _stop                               # Phase 29
+            epoch_acc["kept_mass"]   += float(out_A.spatial_kept_mass)      # Phase 34
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -1220,6 +1250,11 @@ def main(config: EAHNConfig):
                   f"mean_L_localize={epoch_acc['localize'] / _nsbi:.4f}  "
                   f"mean_L_sbi_cls={epoch_acc['sbi_cls'] / _nsbi:.4f}  "
                   f"sbi_passes={epoch_acc['n_sbi']}")
+        if _spatial_topk_active:
+            print(f"[P34] epoch={epoch}  "
+                  f"mean_kept_mass={epoch_acc['kept_mass'] / n:.4f}  "
+                  f"keep_cells={_spatial_topk_k}/{model.N}  "
+                  f"(rising mass = M_t concentrating into kept cells = locally sufficient)")
         history["epoch"].append(epoch)
         history["train_total"].append(epoch_acc["total"]       / n)
         history["train_cls"].append(epoch_acc["cls"]           / n)

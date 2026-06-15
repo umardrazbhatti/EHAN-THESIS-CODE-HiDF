@@ -18,6 +18,7 @@ v4 patch — mt_std ceiling fix:
   actual sharpening temperature (not cross_attention.log_temp which is dead).
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -81,6 +82,17 @@ class EAHNOutput:
     # log(M_frame) as slot-attention prior.  When True, slot_attn is (B, K, T)
     # — slots attend over FRAMES, not (frame, position) pairs.
     cbm_pooled:      bool = False
+    # ── Phase 34: hard spatial top-k attention bottleneck diagnostics ─────────
+    # spatial_topk_frac : keep fraction in effect at the M_t pooling step
+    #                     (0.0 = OFF, exact Phase 33 pooling).
+    # spatial_kept_mass : mean soft-softmax probability mass that sat on the kept
+    #                     top-k cells BEFORE renormalisation (1.0 when OFF).
+    #                     Rises toward 1.0 across epochs as M_t concentrates into
+    #                     the cells the bottleneck keeps — the signal that the
+    #                     attended region is becoming locally SUFFICIENT (the
+    #                     thing insertion measures).
+    spatial_topk_frac:  float = 0.0
+    spatial_kept_mass:  float = 1.0
 
 
 class EarlyAttnHead(nn.Module):
@@ -273,6 +285,23 @@ class EAHN(nn.Module):
         else:
             self.domain_head = None
 
+        # ── Phase 34: hard spatial top-k attention bottleneck ─────────────────
+        # P33 verdict (run 6-15-26): the SBI fake-classification term gave
+        # best-ever detection (0.971) but the seam-localization did NOT make the
+        # HiDF map sufficient — ins_gain stayed negative (worse as lambda_localize
+        # rose) because the SBI seam location != the holistic HiDF evidence
+        # location.  The map is near-uniform (m_t_std 0.03) and the model
+        # average-pools, so NO compact map can pass the insertion test by tuning.
+        # This is the architectural fix: at the M_t spatial-pool step, keep ONLY
+        # the top `spatial_topk_frac` of the N cells (straight-through estimator,
+        # convex renormalisation -> magnitude preserved, the Phase 28
+        # anti-starvation lesson).  The prediction is FORCED to funnel through a
+        # compact region, so the model must concentrate real evidence into the
+        # cells it keeps -> revealing them (insertion) beats random and
+        # faithfulness rises.  Applied identically in every forward (train AND
+        # eval).  0.0 or >=1.0 = OFF (exact Phase 33).  Single Phase-34 axis.
+        self.spatial_topk_frac = float(getattr(config, "spatial_topk_frac", 0.0))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -284,6 +313,39 @@ class EAHN(nn.Module):
             self.temporal_stream.enable_gradient_checkpointing()
         if hasattr(self.spatial_stream, "set_grad_checkpointing"):
             self.spatial_stream.set_grad_checkpointing(True)
+
+    def _spatial_bottleneck(self, M_flat):
+        """Phase 34: hard spatial top-k attention bottleneck (straight-through).
+
+        M_flat : (B, T, N) softmax over the N spatial cells (sums to 1 per b,t).
+        Keeps the top ceil(frac*N) cells per (b,t), renormalises them to a CONVEX
+        combination (sums to 1 -> attn_pool magnitude is preserved no matter how
+        few cells survive; this is the Phase 28 anti-starvation guarantee), and
+        passes the gradient straight through to the soft map so every cell still
+        learns whether to rise into / fall out of the kept set.
+
+        Returns (M_pool, kept_mass) where kept_mass is the mean soft probability
+        mass that already sat on the kept cells BEFORE renormalisation — a
+        diagnostic that rises toward 1.0 as M_t concentrates.
+
+        No-op (returns the soft map unchanged, kept_mass=1.0) when frac<=0 or
+        >=1 — so spatial_topk_frac=0.0 is exact Phase 33 behaviour.
+        """
+        frac = self.spatial_topk_frac
+        B, T, N = M_flat.shape
+        if frac <= 0.0 or frac >= 1.0:
+            return M_flat, 1.0
+        k = max(1, int(math.ceil(frac * N)))
+        if k >= N:
+            return M_flat, 1.0
+        topi = M_flat.topk(k, dim=-1).indices                       # (B, T, k)
+        mask = torch.zeros_like(M_flat).scatter_(-1, topi, 1.0)     # exactly k ones
+        kept = M_flat * mask                                        # soft mass on kept cells
+        kept_mass = kept.sum(dim=-1, keepdim=True)                  # (B, T, 1) pre-renorm
+        M_hard = kept / kept_mass.clamp(min=1e-4)                   # convex renorm (fp16-safe)
+        # Straight-through: forward = M_hard, backward = identity to the soft map.
+        M_pool = (M_hard - M_flat).detach() + M_flat
+        return M_pool, float(kept_mass.mean().item())
 
     def forward(self, frames: torch.Tensor,
                 lambda_grl: float = 0.0) -> EAHNOutput:
@@ -337,7 +399,15 @@ class EAHN(nn.Module):
             _alpha_val = 0.0
 
         M_flat = M_t_use.reshape(B, T, N)
-        attn_pool_per_frame = (Q * M_flat.unsqueeze(-1)).sum(dim=2)   # (B, T, d)
+        # ── Phase 34: hard spatial top-k bottleneck on the pooling map (STE) ──
+        # Funnels the ENTIRE prediction (classifier AND the serial CBM, which
+        # reads attn_pool_per_frame) through the top-k cells of M_t, so the
+        # attended region is forced to be locally sufficient.  No-op when
+        # spatial_topk_frac is 0.0 (exact Phase 33).  The RETURNED M_t stays the
+        # full soft map — the insertion metric reveals highest-M cells first,
+        # which are exactly the kept cells, so the ranking is consistent.
+        M_flat_pool, _kept_mass = self._spatial_bottleneck(M_flat)
+        attn_pool_per_frame = (Q * M_flat_pool.unsqueeze(-1)).sum(dim=2)   # (B, T, d)
 
         # ── Phase 23: temporal attention bottleneck (replaces .mean(dim=1)) ──
         # Force the classifier to depend on which FRAMES carry attention mass,
@@ -441,4 +511,6 @@ class EAHN(nn.Module):
             cbm_coupled=(self.cbm_coupled and not self.cbm_pooled
                          and self.cbm is not None),
             cbm_pooled=(self.cbm_pooled and self.cbm is not None),
+            spatial_topk_frac=float(self.spatial_topk_frac),
+            spatial_kept_mass=_kept_mass,
         )
