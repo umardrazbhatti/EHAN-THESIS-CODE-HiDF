@@ -199,6 +199,31 @@ class EAHNConfig:
     # matter how good the map is.  "mean"/"black" give a cleaner sufficiency
     # readout.  Eval-only, zero training risk.  "blur" = exact P34 headline.
     insertion_baseline:  str   = "blur"    # blur | mean | black
+    # ── Phase 36: intrinsic multi-layer evidence DECOMPOSITION ────────────────
+    # P35 verdict: a single (or dual) compact map cannot be both necessary AND
+    # sufficient on HOLISTIC fakes -- the whole face is regenerated, so the
+    # evidence is DISTRIBUTED, not in one spot.  Fix (the user's "layer-by-layer"
+    # idea, made INTRINSIC): the model emits L complementary attention maps
+    # (layers) + a learnable CONVEX contribution weight per layer, all inside the
+    # forward pass.  The prediction pools through the weighted mixture, so the
+    # decomposition is faithful BY CONSTRUCTION and the per-layer weights read out
+    # as "layer k explains X% of the evidence" -- distributed evidence finally
+    # gets a distributed explanation.  The combined map REPLACES M_t downstream,
+    # so every existing metric (insertion/deletion/faithfulness/heatmaps) scores
+    # the decomposition with no eval changes.  A cold-start gate blends the
+    # decomposition with the proven single map (sigmoid(decomp_gate_init)=0.38 ->
+    # 62% proven map at init) so detection is protected.
+    #   parallel   (EXP-A): L independent heads + diversity loss -> complementary.
+    #   sequential (EXP-B): 1 head applied L times with suppression (peels the
+    #                       evidence layer by layer) -> complementary by build.
+    # decomp_enabled=False = exact Phase 33/34/35 single-map (full back-compat).
+    decomp_enabled:    bool  = False        # master switch (Phase 36)
+    decomp_mode:       str   = "parallel"   # parallel | sequential
+    decomp_layers:     int   = 4            # L = number of evidence layers
+    lambda_decomp_div: float = 0.1          # diversity weight (parallel; 0 = off)
+    decomp_gate_init:  float = -0.5         # init of the decomp-vs-single blend gate;
+                                            # sigmoid(-0.5)=0.378 -> 62% proven map at
+                                            # cold start (detection-protective).
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -588,6 +613,30 @@ def parse_args() -> argparse.Namespace:
                              "blur (P34 headline) | mean | black. Alternate baselines "
                              "lift the absolute insertion number the blur floor caps. "
                              "Zero training risk.")
+    # ── Phase 36: intrinsic multi-layer evidence decomposition ────────────────
+    parser.add_argument("--decomp_enabled", dest="decomp_enabled",
+                        action="store_true", default=None,
+                        help="Phase 36: enable the intrinsic multi-layer evidence "
+                             "decomposition (L complementary attention maps + a convex "
+                             "per-layer contribution weight, in the forward pass). The "
+                             "combined map replaces M_t downstream so all metrics score "
+                             "the decomposition. OFF = single-map Phase 33/34/35.")
+    parser.add_argument("--decomp_mode", type=str, default=None,
+                        choices=["parallel", "sequential"],
+                        help="Phase 36: parallel = L independent heads + diversity loss "
+                             "(EXP-A); sequential = 1 head applied L times with "
+                             "suppression, peeling evidence layer by layer (EXP-B).")
+    parser.add_argument("--decomp_layers", type=int, default=None,
+                        help="Phase 36: L = number of evidence layers (default 4).")
+    parser.add_argument("--lambda_decomp_div", type=float, default=None,
+                        help="Phase 36: weight on the layer-diversity loss (pairwise "
+                             "map overlap; parallel mode). Default 0.1; 0.0 = off "
+                             "(sequential mode separates by construction).")
+    parser.add_argument("--decomp_gate_init", type=float, default=None,
+                        help="Phase 36: init of the blend gate between the decomposition "
+                             "and the proven single map. sigmoid(init) = decomposition "
+                             "share at cold start. Default -0.5 (0.378 -> 62%% proven "
+                             "map, detection-protective).")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

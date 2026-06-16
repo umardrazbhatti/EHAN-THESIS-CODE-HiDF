@@ -107,6 +107,22 @@ class EAHNOutput:
     M_suff_up:       torch.Tensor = None
     suff_kept_mass:  float = 1.0
     lens_gate:       float = 0.0
+    # ── Phase 36: intrinsic multi-layer evidence decomposition ────────────────
+    # M_layers      : (B, T, L, N) the L per-layer softmax attention maps (each
+    #                 sums to 1 over the N cells).  None when decomp_enabled=False.
+    # layer_weights : (B, T, L) CONVEX per-layer contribution weights (sum to 1
+    #                 over L) -- "layer k explains layer_weights[..,k] of the
+    #                 evidence".  None when off.
+    # decomp_overlap: mean pairwise inner-product of the L maps (lower = more
+    #                 complementary layers).  0.0 when off.
+    # decomp_gate   : sigmoid(decomp_gate) -- the share of the pooling map that
+    #                 comes from the decomposition vs the proven single map.  When
+    #                 ON, the returned M_t/M_t_up ARE the combined (mixture) map,
+    #                 so every downstream metric scores the decomposition.
+    M_layers:        torch.Tensor = None
+    layer_weights:   torch.Tensor = None
+    decomp_overlap:  float = 0.0
+    decomp_gate:     float = 0.0
 
 
 class EarlyAttnHead(nn.Module):
@@ -336,6 +352,39 @@ class EAHN(nn.Module):
         else:
             self.suff_attn = None
 
+        # ── Phase 36: intrinsic multi-layer evidence decomposition ────────────
+        # Emit L complementary attention maps (layers) + a learnable convex
+        # contribution weight per layer, all in the forward pass.  The prediction
+        # pools through the weighted mixture (blended with the proven single map
+        # by a cold-start-safe gate), so the decomposition is faithful by
+        # construction and reads out as "layer k = X% of the evidence".
+        #   parallel  : L independent score heads (diversity loss separates them).
+        #   sequential: 1 score head applied L times with suppression between steps
+        #               (R <- R*(1-M_k)) so each step finds NEW evidence.
+        # OFF (default) -> never built; M_t path is byte-identical to Phase 33-35.
+        self.decomp_enabled = bool(getattr(config, "decomp_enabled", False))
+        self.decomp_mode    = str(getattr(config, "decomp_mode", "parallel"))
+        self.decomp_layers  = int(getattr(config, "decomp_layers", 4))
+        if self.decomp_enabled:
+            _nh = self.decomp_layers if self.decomp_mode == "parallel" else 1
+            self.decomp_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(d),
+                    nn.Linear(d, max(d // 4, 32)),
+                    nn.GELU(),
+                    nn.Linear(max(d // 4, 32), 1),
+                )
+                for _ in range(_nh)
+            ])
+            self.decomp_weight  = nn.Linear(d, 1)              # per-layer pooled -> score
+            self.decomp_log_tau = nn.Parameter(torch.tensor(-0.693))  # tau ~ 0.5
+            # gate blends the decomposition vs the proven single map; init negative
+            # so cold start keeps most of the proven map (detection-protective).
+            self.decomp_gate    = nn.Parameter(
+                torch.tensor(float(getattr(config, "decomp_gate_init", -0.5))))
+        else:
+            self.decomp_heads = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -383,6 +432,62 @@ class EAHN(nn.Module):
         # Straight-through: forward = M_hard, backward = identity to the soft map.
         M_pool = (M_hard - M_flat).detach() + M_flat
         return M_pool, float(kept_mass.mean().item())
+
+    def _decompose(self, Q, M_base):
+        """Phase 36: intrinsic multi-layer evidence decomposition.
+
+        Q      : (B, T, N, d) transformer features (the representation being pooled).
+        M_base : (B, T, h, w) the proven single map (early + refined) — kept as a
+                 cold-start anchor in the convex blend so detection is protected.
+
+        Returns:
+          M_mix    : (B, T, h, w) convex blend  (1-g)*M_base + g*(sum_k a_k M^k)
+                     — the NEW pooling map; replaces M_t downstream so every metric
+                     scores the decomposition.  Still sums to 1 per (b,t) (convex).
+          M_layers : (B, T, L, N) the L per-layer softmax maps.
+          layer_w  : (B, T, L) convex per-layer contribution weights (sum to 1).
+          overlap  : float mean pairwise inner-product of the L maps (diagnostic).
+          gate     : float sigmoid(decomp_gate) — decomposition share vs M_base.
+        """
+        B, T, N, d = Q.shape
+        tau = self.decomp_log_tau.exp().clamp(min=0.1, max=3.0)
+        if self.decomp_mode == "sequential":
+            # Peel evidence layer by layer: attend, then SUPPRESS the attended
+            # region so the next step is forced onto NEW evidence.
+            R = Q
+            maps = []
+            for _ in range(self.decomp_layers):
+                score = self.decomp_heads[0](R).squeeze(-1)            # (B, T, N)
+                M_k   = F.softmax(score / tau, dim=-1)                 # (B, T, N)
+                maps.append(M_k)
+                R = R * (1.0 - M_k).unsqueeze(-1)                      # suppress
+            M_layers = torch.stack(maps, dim=2)                        # (B, T, L, N)
+        else:  # parallel — L independent heads (diversity loss separates them)
+            maps = [F.softmax(h(Q).squeeze(-1) / tau, dim=-1)
+                    for h in self.decomp_heads]
+            M_layers = torch.stack(maps, dim=2)                        # (B, T, L, N)
+
+        # Per-layer pooled features -> convex contribution weights.
+        pooled  = (Q.unsqueeze(2) * M_layers.unsqueeze(-1)).sum(dim=3)  # (B, T, L, d)
+        scores  = self.decomp_weight(pooled).squeeze(-1)               # (B, T, L)
+        layer_w = F.softmax(scores, dim=-1)                            # (B, T, L) convex
+        M_mix_layers = (layer_w.unsqueeze(-1) * M_layers).sum(dim=2)   # (B, T, N) convex
+
+        # Cold-start-safe blend with the proven single map (both convex -> convex).
+        g           = torch.sigmoid(self.decomp_gate)
+        M_base_flat = M_base.reshape(B, T, N)
+        M_mix_flat  = (1.0 - g) * M_base_flat + g * M_mix_layers       # (B, T, N)
+
+        # Overlap diagnostic (no grad): mean off-diagonal pairwise inner product.
+        with torch.no_grad():
+            gram = torch.einsum("btln,btmn->btlm", M_layers, M_layers)  # (B,T,L,L)
+            Ld   = self.decomp_layers
+            diag = gram.diagonal(dim1=-2, dim2=-1).sum(-1)              # (B, T)
+            offm = (gram.sum(dim=(-1, -2)) - diag) / max(Ld * (Ld - 1), 1)
+            overlap = float(offm.mean().item())
+
+        M_mix = M_mix_flat.reshape(B, T, self.feat_h, self.feat_w)
+        return M_mix, M_layers, layer_w, overlap, float(g.item())
 
     def forward(self, frames: torch.Tensor,
                 lambda_grl: float = 0.0) -> EAHNOutput:
@@ -434,6 +539,20 @@ class EAHN(nn.Module):
         else:
             M_t_use    = M_t_early
             _alpha_val = 0.0
+
+        # ── Phase 36: intrinsic multi-layer evidence decomposition ────────────
+        # Replace M_t_use with the convex mixture of L complementary layer maps
+        # (blended with the proven map by the cold-start gate).  Because this
+        # rebinds M_t_use BEFORE everything downstream, the pooling, M_t_up, the
+        # B-pass sufficiency map (M_suff aliases M_t when dual-lens is off), the
+        # returned M_t, and ALL eval metrics flow through the decomposition with
+        # no further wiring.  OFF -> M_t_use unchanged (byte-identical).
+        if self.decomp_enabled:
+            (M_t_use, _M_layers, _layer_w,
+             _decomp_overlap, _decomp_gate_val) = self._decompose(Q, M_t_use)
+        else:
+            _M_layers, _layer_w = None, None
+            _decomp_overlap, _decomp_gate_val = 0.0, 0.0
 
         M_flat = M_t_use.reshape(B, T, N)
         # ── Phase 34: hard spatial top-k bottleneck on the pooling map (STE) ──
@@ -583,4 +702,8 @@ class EAHN(nn.Module):
             M_suff_up=M_suff_up_use,
             suff_kept_mass=_suff_kept,
             lens_gate=_lens_gate_val,
+            M_layers=_M_layers,
+            layer_weights=_layer_w,
+            decomp_overlap=_decomp_overlap,
+            decomp_gate=_decomp_gate_val,
         )

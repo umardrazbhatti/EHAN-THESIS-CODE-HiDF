@@ -305,6 +305,24 @@ def main(config: EAHNConfig):
         f"(B-pass+faith -> M_suff; D-pass+seam -> M_nec; classifier reads both pools)"
     )
 
+    # ── Phase 36: intrinsic multi-layer evidence decomposition ────────────────
+    # L complementary attention maps + convex per-layer weights, in the forward
+    # pass; the combined map replaces M_t downstream so every metric scores the
+    # decomposition.  parallel = L heads + diversity loss; sequential = 1 head x L
+    # steps with suppression.  Lives in EAHN.forward -- this just reports config
+    # and the diversity weight added to l_total below.  OFF = single-map P33/34/35.
+    _decomp_enabled = bool(getattr(config, "decomp_enabled", False))
+    _decomp_mode    = str(getattr(config, "decomp_mode", "parallel"))
+    _decomp_L       = int(getattr(config, "decomp_layers", 4))
+    _lam_decomp_div = float(getattr(config, "lambda_decomp_div", 0.1))
+    _decomp_active  = _decomp_enabled
+    print(
+        f"[Phase36] decomp_enabled={_decomp_enabled}  mode={_decomp_mode}  "
+        f"layers={_decomp_L}  lambda_div={_lam_decomp_div}  "
+        f"gate_init={getattr(config, 'decomp_gate_init', -0.5)}  "
+        f"(intrinsic multi-layer decomposition; combined map replaces M_t downstream)"
+    )
+
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
     _lambda_sharp = float(getattr(config, "lambda_sharp", 0.15))
@@ -414,6 +432,9 @@ def main(config: EAHNConfig):
             "localize": 0.0, "sbi_cls": 0.0, "n_sbi": 0,  # Phase 33
             "kept_mass": 0.0,                             # Phase 34
             "suff_kept": 0.0, "lens_gate": 0.0,          # Phase 35 (dual-lens)
+            "decomp_div": 0.0, "decomp_overlap": 0.0,    # Phase 36
+            "decomp_gate": 0.0,                           # Phase 36
+            "decomp_share": np.zeros(_decomp_L),         # Phase 36 per-layer shares
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
             "n_b": 0, "n_d": 0,                           # Phase 30: pass counts
         }
@@ -727,6 +748,25 @@ def main(config: EAHNConfig):
                 # sharpness_loss() = -std(M_t_logits) per (b,t), averaged.
                 loss_sharp = sharpness_loss(M_t_logits)
 
+                # ── Phase 36: decomposition layer-diversity loss ──────────────
+                # Push the L layer maps to be COMPLEMENTARY (cover different
+                # regions) so the decomposition is a real multi-region partition,
+                # not L copies of one blob.  Mean off-diagonal pairwise inner
+                # product of the L softmax maps; minimised.  Parallel mode only
+                # (sequential separates by construction via suppression -> run
+                # with lambda_decomp_div 0).  Zero when decomp is OFF.
+                if (out_A.M_layers is not None) and (_lam_decomp_div > 0.0):
+                    _ml   = out_A.M_layers                          # (B, T, L, N)
+                    _Ld   = _ml.shape[2]
+                    _gram = torch.einsum("btln,btmn->btlm", _ml, _ml)  # (B,T,L,L)
+                    _diag = _gram.diagonal(dim1=-2, dim2=-1).sum(-1)    # (B, T)
+                    loss_decomp_div = (
+                        (_gram.sum(dim=(-1, -2)) - _diag)
+                        / max(_Ld * (_Ld - 1), 1)
+                    ).mean()
+                else:
+                    loss_decomp_div = torch.zeros((), device=frames.device)
+
                 # ── Loss weighting ────────────────────────────────────────────
                 _global_step = (epoch - 1) * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
@@ -793,7 +833,8 @@ def main(config: EAHNConfig):
                            + _lam_cbm_aux            * loss_cbm_aux       # Phase 26
                            + _lam_cbm_div            * loss_cbm_div       # Phase 26
                            + _lam_cbm_main_aux       * loss_cbm_main_aux  # Phase 27
-                           + lam_dom_eff             * loss_domain)       # Phase 27
+                           + lam_dom_eff             * loss_domain        # Phase 27
+                           + _lam_decomp_div         * loss_decomp_div)   # Phase 36
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
@@ -1104,6 +1145,13 @@ def main(config: EAHNConfig):
                           f"suff_kept_mass={float(out_A.suff_kept_mass):.4f}  "
                           f"suff_keep_cells={_suff_k}/{model.N}  "
                           f"(M_nec=necessity/seam/D-pass; M_suff=sufficiency/B-pass/faith)")
+                if _decomp_active and out_A.layer_weights is not None:
+                    _lw0 = out_A.layer_weights.mean(dim=(0, 1)).detach().cpu().numpy()
+                    print(f"[DIAG-P36] decomp=ON  mode={_decomp_mode}  layers={_decomp_L}  "
+                          f"gate={float(out_A.decomp_gate):.4f}  "
+                          f"overlap={float(out_A.decomp_overlap):.4f}  "
+                          f"layer_w={np.round(_lw0, 3).tolist()}  "
+                          f"(gate=decomp share vs single map; layer_w=per-layer evidence %)")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -1204,6 +1252,12 @@ def main(config: EAHNConfig):
             epoch_acc["kept_mass"]   += float(out_A.spatial_kept_mass)      # Phase 34
             epoch_acc["suff_kept"]   += float(out_A.suff_kept_mass)         # Phase 35
             epoch_acc["lens_gate"]   += float(out_A.lens_gate)              # Phase 35
+            epoch_acc["decomp_div"]     += float(loss_decomp_div.item())    # Phase 36
+            epoch_acc["decomp_overlap"] += float(out_A.decomp_overlap)      # Phase 36
+            epoch_acc["decomp_gate"]    += float(out_A.decomp_gate)         # Phase 36
+            if out_A.layer_weights is not None:                            # Phase 36
+                epoch_acc["decomp_share"] += (
+                    out_A.layer_weights.mean(dim=(0, 1)).detach().cpu().numpy())
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -1299,6 +1353,17 @@ def main(config: EAHNConfig):
                   f"mean_suff_kept_mass={epoch_acc['suff_kept'] / n:.4f}  "
                   f"suff_keep_cells={_suff_k}/{model.N}  "
                   f"(gate = sufficiency weight in the blend; suff_kept rising = M_suff concentrating)")
+        if _decomp_active:
+            _shares = epoch_acc["decomp_share"] / max(n, 1)             # (L,)
+            _shares_str = "  ".join(
+                f"L{i+1}={s * 100:.0f}%" for i, s in enumerate(_shares))
+            print(f"[P36] epoch={epoch}  mode={_decomp_mode}  "
+                  f"mean_gate={epoch_acc['decomp_gate'] / n:.4f}  "
+                  f"mean_overlap={epoch_acc['decomp_overlap'] / n:.4f}  "
+                  f"mean_div_loss={epoch_acc['decomp_div'] / n:.4f}  "
+                  f"layer_shares: {_shares_str}  "
+                  f"(gate=decomp vs single map; lower overlap=more complementary layers; "
+                  f"shares=per-layer % of the evidence)")
         history["epoch"].append(epoch)
         history["train_total"].append(epoch_acc["total"]       / n)
         history["train_cls"].append(epoch_acc["cls"]           / n)
