@@ -424,7 +424,8 @@ def spatial_band_loss(M_t: torch.Tensor,
 
 
 def localization_loss(M_t: torch.Tensor,
-                      boundary: torch.Tensor) -> torch.Tensor:
+                      boundary: torch.Tensor,
+                      frame_weight: torch.Tensor = None) -> torch.Tensor:
     """Phase 33: pull the intrinsic attention M_t onto the self-blend seam.
 
     This is the direct fix for the insertion wall.  Runs 6-13/6-14 proved the
@@ -463,7 +464,16 @@ def localization_loss(M_t: torch.Tensor,
     # with clip_grad_norm=1.0 it would dominate the clipped gradient budget and
     # throttle detection learning.  Unit scale makes lambda_localize directly
     # comparable to lambda_faith / lambda_ins.
-    return ce.mean() / _math.log(float(h * w))
+    # Phase 35: optional per-frame weight (the SBI frame_mask) so only the
+    # MANIPULATED frames of a temporally-partial fake are pulled onto the seam --
+    # clean frames have no seam and must not be supervised.  None = all frames
+    # equally (exact Phase 33 behaviour).
+    if frame_weight is not None:
+        fw = frame_weight.to(ce.dtype)                       # (B, T); avoid shadowing width w
+        ce = (ce * fw).sum() / fw.sum().clamp(min=1.0)
+    else:
+        ce = ce.mean()
+    return ce / _math.log(float(h * w))
 
 
 def full_blur_input(x: torch.Tensor,

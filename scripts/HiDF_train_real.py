@@ -265,10 +265,20 @@ def main(config: EAHNConfig):
     _sbi_hi          = float(getattr(config, "sbi_blend_hi", 0.55))
     _sbi_stride      = max(int(getattr(config, "sbi_stride", 8)), 1)
     _sbi_active      = _sbi_enabled and _lambda_localize > 0.0
+    # ── Phase 35: enhanced generator (artifact modes + temporally-partial) ────
+    _sbi_modes = tuple(s.strip() for s in
+                       str(getattr(config, "sbi_modes", "blend")).split(",")
+                       if s.strip()) or ("blend",)
+    _sbi_plo   = float(getattr(config, "sbi_partial_frac_lo", 1.0))
+    _sbi_phi   = float(getattr(config, "sbi_partial_frac_hi", 1.0))
     print(
         f"[Phase33] sbi_enabled={_sbi_enabled}  lambda_localize={_lambda_localize}  "
         f"lambda_sbi_cls={_lambda_sbi_cls}  blend=[{_sbi_lo},{_sbi_hi}]  "
         f"stride={_sbi_stride}  active={_sbi_active}"
+    )
+    print(
+        f"[Phase35] sbi_modes={list(_sbi_modes)}  partial_frac=[{_sbi_plo},{_sbi_phi}]  "
+        f"(modes=cross-dataset artifacts; partial<1.0=key-frame for k-drops)"
     )
 
     # ── Phase 34: hard spatial top-k attention bottleneck ─────────────────────
@@ -282,6 +292,17 @@ def main(config: EAHNConfig):
     print(
         f"[Phase34] spatial_topk_frac={_spatial_topk}  active={_spatial_topk_active}  "
         f"keep_cells={_spatial_topk_k}/{model.N}  (insertion bottleneck; STE + convex renorm)"
+    )
+
+    # ── Phase 35: dual-lens (necessity M_nec + sufficiency M_suff) ────────────
+    _dual_lens = bool(getattr(config, "dual_lens_enabled", False))
+    _suff_frac = float(getattr(config, "suff_topk_frac", 0.0))
+    _suff_k    = (max(1, int(math.ceil(_suff_frac * model.N)))
+                  if 0.0 < _suff_frac < 1.0 else model.N)
+    print(
+        f"[Phase35] dual_lens={_dual_lens}  suff_topk_frac={_suff_frac}  "
+        f"suff_keep_cells={_suff_k}/{model.N}  "
+        f"(B-pass+faith -> M_suff; D-pass+seam -> M_nec; classifier reads both pools)"
     )
 
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
@@ -392,6 +413,7 @@ def main(config: EAHNConfig):
             "slot_on_top": 0.0,                           # Phase 29
             "localize": 0.0, "sbi_cls": 0.0, "n_sbi": 0,  # Phase 33
             "kept_mass": 0.0,                             # Phase 34
+            "suff_kept": 0.0, "lens_gate": 0.0,          # Phase 35 (dual-lens)
             "sparse": 0.0, "peak_spread": 0.0, "sharp": 0.0, "n": 0,
             "n_b": 0, "n_d": 0,                           # Phase 30: pass counts
         }
@@ -438,6 +460,9 @@ def main(config: EAHNConfig):
                 logits_A = out_A.logit
                 M_t      = out_A.M_t          # (B, T, h, w) softmax from EarlyAttnHead
                 M_t_logits = out_A.M_t_logits  # (B, T, h, w) pre-softmax raw scores
+                # Phase 35: B-pass (sufficiency) targets M_suff; equals M_t when
+                # dual_lens is OFF, so the single-lens path is byte-identical.
+                M_suff   = out_A.M_suff
                 loss_cls = cls_loss_fn(logits_A, labels)
 
                 # Phase 30: B-pass and D-pass ALTERNATE by step parity so the
@@ -480,7 +505,7 @@ def main(config: EAHNConfig):
                     else:
                         _ins_frac = 0.0
                     x_b = build_bottlenecked_input(
-                        frames, M_t,
+                        frames, M_suff,                                 # Phase 35: sufficiency lens
                         blur_kernel=config.blur_kernel,
                         blur_sigma=config.blur_sigma,
                         peak_floor=config.bottleneck_peak_floor,        # Phase 22 (soft path only)
@@ -818,9 +843,11 @@ def main(config: EAHNConfig):
                 _real_sel = (labels.reshape(-1) < 0.5)
                 if bool(_real_sel.any()):
                     with autocast(_dev_str, enabled=False):
-                        _sbi_frames, _sbi_boundary = make_sbi_batch(
+                        _sbi_frames, _sbi_boundary, _sbi_fmask = make_sbi_batch(
                             frames[_real_sel].float(),
                             blend_lo=_sbi_lo, blend_hi=_sbi_hi,
+                            modes=_sbi_modes,                          # Phase 35: artifact families
+                            partial_lo=_sbi_plo, partial_hi=_sbi_phi,  # Phase 35: temporally-partial
                         )
                     with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
                         out_sbi       = model(_sbi_frames)
@@ -828,7 +855,11 @@ def main(config: EAHNConfig):
                             _sbi_frames.shape[0], device=frames.device
                         )
                         loss_sbi_cls  = cls_loss_fn(out_sbi.logit, _sbi_lbl)
-                        loss_localize = localization_loss(out_sbi.M_t, _sbi_boundary)
+                        # Phase 35: seam -> necessity lens (out_sbi.M_t = M_nec),
+                        # weighted by frame_mask so clean frames of a partial fake
+                        # are not pulled onto a seam they do not carry.
+                        loss_localize = localization_loss(
+                            out_sbi.M_t, _sbi_boundary, frame_weight=_sbi_fmask)
                         _lam_loc_eff  = _faith_warmup(
                             epoch, config.faith_warmup_epochs, _lambda_localize
                         )
@@ -1068,6 +1099,11 @@ def main(config: EAHNConfig):
                 else:
                     print("[DIAG-P34] spatial_topk=OFF (frac=0) -- pooling over all "
                           "cells (Phase 33 behaviour); insertion stays holistic-limited.")
+                if _dual_lens:
+                    print(f"[DIAG-P35] dual_lens=ON  lens_gate={float(out_A.lens_gate):.4f}  "
+                          f"suff_kept_mass={float(out_A.suff_kept_mass):.4f}  "
+                          f"suff_keep_cells={_suff_k}/{model.N}  "
+                          f"(M_nec=necessity/seam/D-pass; M_suff=sufficiency/B-pass/faith)")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
@@ -1166,6 +1202,8 @@ def main(config: EAHNConfig):
             epoch_acc["eff_spatial"] += _eff_sp                             # Phase 29
             epoch_acc["slot_on_top"] += _stop                               # Phase 29
             epoch_acc["kept_mass"]   += float(out_A.spatial_kept_mass)      # Phase 34
+            epoch_acc["suff_kept"]   += float(out_A.suff_kept_mass)         # Phase 35
+            epoch_acc["lens_gate"]   += float(out_A.lens_gate)              # Phase 35
             epoch_acc["sparse"]      += _ls
             epoch_acc["peak_spread"] += _lps; epoch_acc["sharp"]  += _lsh
             epoch_acc["n"]           += 1
@@ -1255,6 +1293,12 @@ def main(config: EAHNConfig):
                   f"mean_kept_mass={epoch_acc['kept_mass'] / n:.4f}  "
                   f"keep_cells={_spatial_topk_k}/{model.N}  "
                   f"(rising mass = M_t concentrating into kept cells = locally sufficient)")
+        if _dual_lens:
+            print(f"[P35] epoch={epoch}  "
+                  f"mean_lens_gate={epoch_acc['lens_gate'] / n:.4f}  "
+                  f"mean_suff_kept_mass={epoch_acc['suff_kept'] / n:.4f}  "
+                  f"suff_keep_cells={_suff_k}/{model.N}  "
+                  f"(gate = sufficiency weight in the blend; suff_kept rising = M_suff concentrating)")
         history["epoch"].append(epoch)
         history["train_total"].append(epoch_acc["total"]       / n)
         history["train_cls"].append(epoch_acc["cls"]           / n)

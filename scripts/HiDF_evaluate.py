@@ -414,6 +414,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     all_probs, all_labels = [], []
     all_vid_paths        = []
     _M_chunks            = []
+    _Msuff_chunks        = []                                 # Phase 35: sufficiency lens
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating detection"):
@@ -422,11 +423,13 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             all_probs.extend(out.prob.detach().cpu().tolist())
             all_labels.extend(batch["label"].cpu().tolist())
             all_vid_paths.extend(batch.get("video_path", [""] * frames.shape[0]))
-            _M_chunks.append(out.M_t_up.detach())             # keep GPU
+            _M_chunks.append(out.M_t_up.detach())             # keep GPU (necessity lens)
+            _Msuff_chunks.append(out.M_suff_up.detach())      # Phase 35 (= M_t_up single-lens)
             del frames, out
 
     all_M_t_up = torch.cat(_M_chunks, dim=0)                  # (N_test, T, H, W) GPU
-    del _M_chunks
+    all_M_suff_up = torch.cat(_Msuff_chunks, dim=0)           # Phase 35: insertion saliency
+    del _M_chunks, _Msuff_chunks
 
     det_metrics = DetectionMetrics.compute(all_probs, all_labels)
     print("Detection Metrics:", det_metrics)
@@ -548,14 +551,19 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
                            for i in range(_n_del_ins)]          # each (T,C,H,W)
         _frames_stack   = torch.stack(_di_frames_list, dim=0)   # (N,T,C,H,W)
         _sal_indices    = [int(indices[i]) for i in range(_n_del_ins)]
-        _sal_stack      = all_M_t_up[_sal_indices]              # (N,T,H,W) GPU tensor
+        _sal_stack      = all_M_t_up[_sal_indices]              # (N,T,H,W) necessity (deletion)
         _sal_np         = _sal_stack.detach().cpu().numpy()
+        # Phase 35: insertion ranks by the sufficiency lens (= necessity when
+        # single-lens, so non-dual runs reproduce the exact P34 del/ins result).
+        _sal_ins_np     = all_M_suff_up[_sal_indices].detach().cpu().numpy()
+        _ins_baseline   = str(getattr(config, "insertion_baseline", "blur"))
         _di_labels      = np.asarray(
             [int(test_ds[int(indices[i])]["label"]) for i in range(_n_del_ins)]
         )
         del_ins = ExplanationMetrics.deletion_insertion_auc(
             model, _frames_stack, _sal_np, steps=20, n_samples=_n_del_ins,
             labels=_di_labels, chunk=4, random_control=True,
+            saliency_ins=_sal_ins_np, baseline=_ins_baseline,
         )
     except Exception as e:
         print(f"  [Deletion/Insertion AUC error: {e}]")
@@ -1161,6 +1169,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             run_explanation_suite(
                 model, test_loader, config, _exp_out_path,
                 all_M_t_up_gpu=all_M_t_up,
+                all_M_suff_up_gpu=all_M_suff_up,          # Phase 35: insertion saliency
                 all_probs=all_probs,
                 all_labels=all_labels,
                 all_vid_paths=all_vid_paths,

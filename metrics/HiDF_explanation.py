@@ -71,7 +71,18 @@ class ExplanationMetrics:
                                chunk: int = 4,
                                random_control: bool = True,
                                seed: int = 123,
-                               verbose: bool = True) -> dict:
+                               verbose: bool = True,
+                               saliency_ins=None,
+                               baseline: str = "blur") -> dict:
+        # Phase 35 (dual-lens / baseline):
+        #   saliency_ins : separate saliency for the INSERTION ordering (the
+        #     sufficiency lens M_suff); deletion keeps using `saliency` (the
+        #     necessity lens M_nec).  None = use `saliency` for both (single-lens,
+        #     exact P34 behaviour).
+        #   baseline : fill for the del/ins canvas -- "blur" (P34 headline; floors
+        #     insertion AUC at ~blurred_conf), "mean" (ImageNet mean = 0 in
+        #     normalised space), or "black".  Alternate baselines give a cleaner
+        #     sufficiency readout.  Eval-only, zero training risk.
         """
         Deletion/Insertion AUC with random-saliency control (Phase 28).
 
@@ -150,7 +161,19 @@ class ExplanationMetrics:
 
         with torch.no_grad():
             baseline_probs = _fwd_probs(frames)
-            blurred_full   = _gauss_blur(frames)            # (B, T, C, H, W)
+            # Phase 35: choose the del/ins canvas.  "blur" preserves low-freq
+            # content (P34 headline); "mean"/"black" are flat baselines that lift
+            # the absolute insertion number the blur floor caps.
+            if baseline == "mean":
+                blurred_full = torch.zeros_like(frames)     # ImageNet mean = 0 (normalised)
+            elif baseline == "black":
+                _mn = torch.tensor((0.485, 0.456, 0.406),
+                                   device=frames.device, dtype=frames.dtype).view(1, 1, 3, 1, 1)
+                _sd = torch.tensor((0.229, 0.224, 0.225),
+                                   device=frames.device, dtype=frames.dtype).view(1, 1, 3, 1, 1)
+                blurred_full = (torch.zeros_like(frames) - _mn) / _sd   # black in normalised space
+            else:
+                blurred_full = _gauss_blur(frames)          # (B, T, C, H, W)
             blurred_probs  = _fwd_probs(blurred_full)
         baseline_conf = float(baseline_probs.mean())
         blurred_conf  = float(blurred_probs.mean())
@@ -158,6 +181,13 @@ class ExplanationMetrics:
         # Use mean explanation over time; per-sample descending pixel ranking
         sal       = saliency.mean(1).reshape(B, -1)             # (B, H*W)
         order_sal = np.argsort(sal, axis=1)[:, ::-1]            # (B, H*W) desc
+        # Phase 35: separate INSERTION ordering from the sufficiency lens (M_suff).
+        # None -> use the deletion ordering for both (single-lens, exact P34).
+        if saliency_ins is not None:
+            sal_i     = np.asarray(saliency_ins)[:B].mean(1).reshape(B, -1)
+            order_ins = np.argsort(sal_i, axis=1)[:, ::-1]
+        else:
+            order_ins = order_sal
         _rng       = np.random.default_rng(seed)
         order_rand = np.stack([_rng.permutation(total_pixels) for _ in range(B)])
 
@@ -170,19 +200,24 @@ class ExplanationMetrics:
             100: steps,
         }
 
-        def _curves(order):
+        def _curves(order, do_del=True, do_ins=True):
             """Run the del/ins sweep for a given (B, H*W) pixel ordering.
-            Returns (steps+1, B) per-sample prob matrices."""
+            Returns (steps+1, B) per-sample prob matrices.  Phase 35: do_del/
+            do_ins let the caller compute deletion from the necessity ordering and
+            insertion from the sufficiency ordering at the SAME total forward cost
+            as one combined sweep."""
             del_mat = np.zeros((steps + 1, B), dtype=np.float64)
             ins_mat = np.zeros((steps + 1, B), dtype=np.float64)
             for step in range(steps + 1):
                 frac = step / steps
                 k    = max(1, int(frac * total_pixels))
 
-                # Deletion: replace top-k pixels with blurred version
-                # Insertion: start blurred, reveal top-k from original
-                del_frames = frames.clone()
-                ins_frames = blurred_full.clone()
+                # Deletion: replace top-k pixels with the baseline
+                # Insertion: start from the baseline, reveal top-k from original
+                if do_del:
+                    del_frames = frames.clone()
+                if do_ins:
+                    ins_frames = blurred_full.clone()
 
                 for b in range(B):
                     top_k_idx = order[b, :k].copy()
@@ -190,14 +225,24 @@ class ExplanationMetrics:
                     mask[top_k_idx] = True
                     mask_2d = mask.reshape(H, W)
 
-                    del_frames[b, :, :, mask_2d] = blurred_full[b, :, :, mask_2d]
-                    ins_frames[b, :, :, mask_2d] = frames[b, :, :, mask_2d]
+                    if do_del:
+                        del_frames[b, :, :, mask_2d] = blurred_full[b, :, :, mask_2d]
+                    if do_ins:
+                        ins_frames[b, :, :, mask_2d] = frames[b, :, :, mask_2d]
 
-                del_mat[step] = _fwd_probs(del_frames)
-                ins_mat[step] = _fwd_probs(ins_frames)
+                if do_del:
+                    del_mat[step] = _fwd_probs(del_frames)
+                if do_ins:
+                    ins_mat[step] = _fwd_probs(ins_frames)
             return del_mat, ins_mat
 
-        del_mat, ins_mat = _curves(order_sal)
+        # Phase 35: when an insertion saliency is supplied, measure deletion on the
+        # necessity ordering and insertion on the sufficiency ordering (same cost).
+        if saliency_ins is None:
+            del_mat, ins_mat = _curves(order_sal)
+        else:
+            del_mat, _ = _curves(order_sal, do_ins=False)
+            _, ins_mat = _curves(order_ins, do_del=False)
 
         # NumPy 2.x removed np.trapz (renamed to np.trapezoid).
         # getattr(np, "trapezoid", np.trapz) looks safe but Python evaluates

@@ -27,6 +27,7 @@ def run_explanation_suite(
     config,
     output_path: Path,
     all_M_t_up_gpu=None,
+    all_M_suff_up_gpu=None,          # Phase 35: sufficiency lens for insertion (None = use M_t)
     all_probs=None,
     all_labels=None,
     all_vid_paths=None,
@@ -165,13 +166,19 @@ def run_explanation_suite(
     for _si, _di in enumerate(di_indices):
         _di = int(_di)
         _f_s = frames_by_idx[_di]                                  # (1, T, C, H, W) GPU
-        _s_s = all_M_t_up_gpu[_di:_di+1].detach().cpu().numpy()    # numpy needed by metric impl
+        _s_s = all_M_t_up_gpu[_di:_di+1].detach().cpu().numpy()    # necessity (deletion)
+        # Phase 35: insertion ranks by the sufficiency lens (= M_t when single-lens,
+        # so non-dual runs reproduce the exact prior insertion result).
+        _su  = all_M_suff_up_gpu if all_M_suff_up_gpu is not None else all_M_t_up_gpu
+        _s_ins = _su[_di:_di+1].detach().cpu().numpy()
         _prob_s  = float(all_probs[_di])
         _label_s = int(all_labels[_di]) if all_labels else -1
         _vpath_s = str(all_vid_paths[_di]) if all_vid_paths else ""
         _di_result = ExplanationMetrics.deletion_insertion_auc(
             model, _f_s, _s_s, steps=20, n_samples=1,
             random_control=True, verbose=False,
+            saliency_ins=_s_ins,
+            baseline=str(getattr(config, "insertion_baseline", "blur")),
         )
         _d_auc = float(_di_result.get("deletion_auc", 0.0))
         _i_auc = float(_di_result.get("insertion_auc", 0.0))

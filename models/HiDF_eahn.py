@@ -93,6 +93,20 @@ class EAHNOutput:
     #                     thing insertion measures).
     spatial_topk_frac:  float = 0.0
     spatial_kept_mass:  float = 1.0
+    # ── Phase 35: dual-lens (sufficiency map) ────────────────────────────────
+    # M_suff    : (B, T, h, w) softmax — the sufficiency lens (a second
+    #             EarlyAttnHead, bottlenecked by suff_topk_frac, trained by the
+    #             B-pass + faithfulness, NO seam prior).  Equals M_t when
+    #             dual_lens_enabled=False so eval/loss code can always read it.
+    # M_suff_up : (B, T, H, W) upsampled M_suff — the saliency the INSERTION
+    #             metric uses (deletion keeps using M_t_up = the necessity lens).
+    # suff_kept_mass : soft mass on the suff lens' kept cells (rises as it
+    #                  concentrates -> the locally-sufficient signal).
+    # lens_gate : sigmoid blend g; attn_pool = (1-g)*nec + g*suff.  0.0 = single.
+    M_suff:          torch.Tensor = None
+    M_suff_up:       torch.Tensor = None
+    suff_kept_mass:  float = 1.0
+    lens_gate:       float = 0.0
 
 
 class EarlyAttnHead(nn.Module):
@@ -302,6 +316,26 @@ class EAHN(nn.Module):
         # eval).  0.0 or >=1.0 = OFF (exact Phase 33).  Single Phase-34 axis.
         self.spatial_topk_frac = float(getattr(config, "spatial_topk_frac", 0.0))
 
+        # ── Phase 35: dual-lens (necessity + sufficiency attention maps) ──────
+        # P34 verdict: a single map cannot be both necessary AND sufficient on
+        # holistic fakes (proven 4-config sweep).  M_nec = the existing M_t path
+        # (no bottleneck, seam + D-pass) carries necessity + cross-dataset;
+        # M_suff = a second EarlyAttnHead (bottlenecked by suff_topk_frac, B-pass
+        # + faithfulness, no seam) carries sufficiency + gradient-faithfulness.
+        # The classifier reads a learnable sigmoid blend of BOTH per-frame pools,
+        # so neither map can decay into decoration.  OFF (default) = exact
+        # single-lens Phase 33/34: suff_attn is never built and M_suff aliases
+        # M_t in the forward output (byte-compatible).
+        self.dual_lens_enabled = bool(getattr(config, "dual_lens_enabled", False))
+        self.suff_topk_frac    = float(getattr(config, "suff_topk_frac", 0.0))
+        if self.dual_lens_enabled:
+            self.suff_attn = EarlyAttnHead(d_model=d, hidden=64)
+            # init 0.0 -> sigmoid 0.5: necessity and sufficiency pools start
+            # equally weighted; training moves the blend.
+            self.lens_gate = nn.Parameter(torch.tensor(0.0))
+        else:
+            self.suff_attn = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -314,8 +348,11 @@ class EAHN(nn.Module):
         if hasattr(self.spatial_stream, "set_grad_checkpointing"):
             self.spatial_stream.set_grad_checkpointing(True)
 
-    def _spatial_bottleneck(self, M_flat):
+    def _spatial_bottleneck(self, M_flat, frac=None):
         """Phase 34: hard spatial top-k attention bottleneck (straight-through).
+
+        Phase 35: `frac` overrides self.spatial_topk_frac so the sufficiency lens
+        can be bottlenecked by suff_topk_frac while the necessity lens is not.
 
         M_flat : (B, T, N) softmax over the N spatial cells (sums to 1 per b,t).
         Keeps the top ceil(frac*N) cells per (b,t), renormalises them to a CONVEX
@@ -331,7 +368,7 @@ class EAHN(nn.Module):
         No-op (returns the soft map unchanged, kept_mass=1.0) when frac<=0 or
         >=1 — so spatial_topk_frac=0.0 is exact Phase 33 behaviour.
         """
-        frac = self.spatial_topk_frac
+        frac = self.spatial_topk_frac if frac is None else frac
         B, T, N = M_flat.shape
         if frac <= 0.0 or frac >= 1.0:
             return M_flat, 1.0
@@ -409,6 +446,25 @@ class EAHN(nn.Module):
         M_flat_pool, _kept_mass = self._spatial_bottleneck(M_flat)
         attn_pool_per_frame = (Q * M_flat_pool.unsqueeze(-1)).sum(dim=2)   # (B, T, d)
 
+        # ── Phase 35: sufficiency lens + dual-pool combine ────────────────────
+        # M_nec = attn_pool_per_frame above (the existing M_t path).  Add a second
+        # head M_suff (bottlenecked by suff_topk_frac), pool Q through it, and feed
+        # the classifier/CBM a learnable blend of BOTH pools so each lens stays
+        # load-bearing.  OFF -> M_suff aliases M_t, attn_pool unchanged (exact P34).
+        if self.dual_lens_enabled:
+            M_suff_t, _, _ = self.suff_attn(feats_5d)                     # (B,T,h,w)
+            M_suff_flat    = M_suff_t.reshape(B, T, N)
+            M_suff_pool, _suff_kept = self._spatial_bottleneck(
+                M_suff_flat, frac=self.suff_topk_frac)
+            pool_suff = (Q * M_suff_pool.unsqueeze(-1)).sum(dim=2)        # (B,T,d)
+            _g = torch.sigmoid(self.lens_gate)
+            attn_pool_per_frame = (1.0 - _g) * attn_pool_per_frame + _g * pool_suff
+            _lens_gate_val = float(_g.item())
+        else:
+            M_suff_t       = M_t_use
+            _suff_kept     = _kept_mass
+            _lens_gate_val = 0.0
+
         # ── Phase 23: temporal attention bottleneck (replaces .mean(dim=1)) ──
         # Force the classifier to depend on which FRAMES carry attention mass,
         # not just average all T frames democratically.  This is the structural
@@ -426,6 +482,16 @@ class EAHN(nn.Module):
             M_t_use.reshape(B * T, 1, self.feat_h, self.feat_w),
             size=(H, W), mode="bilinear", align_corners=False,
         ).reshape(B, T, H, W)
+
+        # Phase 35: upsample the sufficiency map for the insertion metric (deletion
+        # keeps using M_t_up = necessity).  Aliases M_t_up when single-lens.
+        if self.dual_lens_enabled:
+            M_suff_up_use = F.interpolate(
+                M_suff_t.reshape(B * T, 1, self.feat_h, self.feat_w),
+                size=(H, W), mode="bilinear", align_corners=False,
+            ).reshape(B, T, H, W)
+        else:
+            M_suff_up_use = M_t_up_use
 
         main_logit = self.classifier(attn_pool).squeeze(-1)
 
@@ -513,4 +579,8 @@ class EAHN(nn.Module):
             cbm_pooled=(self.cbm_pooled and self.cbm is not None),
             spatial_topk_frac=float(self.spatial_topk_frac),
             spatial_kept_mass=_kept_mass,
+            M_suff=M_suff_t,
+            M_suff_up=M_suff_up_use,
+            suff_kept_mass=_suff_kept,
+            lens_gate=_lens_gate_val,
         )

@@ -163,6 +163,42 @@ class EAHNConfig:
     # P33 detection surplus (0.971 vs 0.92 target).  0.0 or >=1.0 = OFF (exact
     # Phase 33, full back-compat).  This is the single Phase-34 sweep axis.
     spatial_topk_frac: float = 0.0     # keep fraction of the 49 spatial cells (SWEEP axis)
+    # ── Phase 35: DUAL-LENS attention (necessity + sufficiency maps) ──────────
+    # P34 verdict (run 6-16-26): the single bottleneck was a NET REGRESSION -- it
+    # bought partial sufficiency (ins_gain -0.233 -> -0.123, still <0) at the cost
+    # of necessity (del_gain +0.256 -> +0.10) and detection.  The 4-config sweep
+    # PROVED a SINGLE map cannot be both necessary AND sufficient on holistic
+    # fakes (lambda_localize trades necessity-up/sufficiency-down; the bottleneck
+    # trades the other way; neither crosses ins_gain=0).  Fix: TWO complementary
+    # maps.  M_nec (the existing M_t path, NO bottleneck, seam prior + D-pass)
+    # carries necessity + cross-dataset; M_suff (a second EarlyAttnHead,
+    # bottlenecked by suff_topk_frac, B-pass + faithfulness, NO seam) carries
+    # sufficiency + gradient-faithfulness.  The classifier reads a learnable blend
+    # of BOTH per-frame pools so both maps stay load-bearing for the prediction.
+    # dual_lens_enabled=False = exact Phase 33/34 single-lens (full back-compat).
+    dual_lens_enabled: bool  = False   # master switch (Phase 35)
+    suff_topk_frac:    float = 0.0     # sufficiency-lens bottleneck keep-fraction (relocated
+                                       # P34 bottleneck; 0.10 = keep 5/49, the P34 winner).
+                                       # 0.0/>=1.0 = no bottleneck on the suff lens.
+    # ── Phase 35: enhanced pseudo-fake generator (cross-dataset + K-drops) ────
+    # The SBI blend SEAM only ever taught BLEND-fakes (helped Deepfakes 0.79 /
+    # FaceShifter 0.67 but NOT graphics-swap FaceSwap 0.41 or reenactment
+    # Face2Face 0.57).  sbi_modes adds artifact families sampled per SBI batch:
+    #   blend = warp+colour seam (P33, default)   warp = reenactment-style warp
+    #   color = colour/contrast statistical fake  (graphics-swap cue)
+    # sbi_partial_frac_{lo,hi}: fraction of the T frames that carry the artifact
+    # (sampled U[lo,hi] per clip).  1.0/1.0 = all frames (P33, no key frame);
+    # <1.0 manipulates only k of T frames -> a real KEY FRAME exists, so the
+    # temporal gate has something to find and the k1/k2/k4 drop test stops being
+    # noise on fully-fake redundant clips.
+    sbi_modes:           str   = "blend"   # comma-list: blend,warp,color
+    sbi_partial_frac_lo: float = 1.0       # min fraction of frames manipulated (1.0 = all)
+    sbi_partial_frac_hi: float = 1.0       # max fraction; lo=hi=1.0 = P33 (all frames)
+    # ── Phase 35: eval-only alternate insertion baseline ──────────────────────
+    # The blur baseline floors insertion AUC at ~blurred_conf (~0.32-0.40) no
+    # matter how good the map is.  "mean"/"black" give a cleaner sufficiency
+    # readout.  Eval-only, zero training risk.  "blur" = exact P34 headline.
+    insertion_baseline:  str   = "blur"    # blur | mean | black
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -521,6 +557,37 @@ def parse_args() -> argparse.Namespace:
                              "compact region and insertion can beat random. Typical "
                              "0.25-0.50. 0.0 or >=1.0 = OFF (Phase 33 behaviour). "
                              "Applies at train AND eval. Single Phase-34 sweep axis.")
+    # ── Phase 35: dual-lens attention + enhanced generator + eval baseline ────
+    parser.add_argument("--dual_lens_enabled", dest="dual_lens_enabled",
+                        action="store_true", default=None,
+                        help="Phase 35: enable the dual-lens head (necessity map "
+                             "M_nec = existing M_t + sufficiency map M_suff = a second "
+                             "EarlyAttnHead bottlenecked by --suff_topk_frac). Resolves "
+                             "the proven single-map necessity-vs-sufficiency tension. "
+                             "OFF = single-lens Phase 33/34.")
+    parser.add_argument("--suff_topk_frac", type=float, default=None,
+                        help="Phase 35: sufficiency-lens hard top-k keep fraction "
+                             "(relocated P34 bottleneck; 0.10 = keep 5/49). Only M_suff "
+                             "is bottlenecked; M_nec stays full so necessity/deletion is "
+                             "protected. 0.0 = no suff bottleneck.")
+    parser.add_argument("--sbi_modes", type=str, default=None,
+                        help="Phase 35: comma-list of pseudo-fake artifact modes to "
+                             "sample (blend,warp,color). blend=P33 seam; warp="
+                             "reenactment warp; color=graphics-swap colour fake. "
+                             "Default 'blend' = exact P33.")
+    parser.add_argument("--sbi_partial_frac_lo", type=float, default=None,
+                        help="Phase 35: min fraction of the T frames that carry the "
+                             "pseudo-fake artifact (U[lo,hi] per clip). <1.0 creates a "
+                             "key frame so k1/k2/k4 frame-drop becomes meaningful. "
+                             "1.0 = all frames (P33).")
+    parser.add_argument("--sbi_partial_frac_hi", type=float, default=None,
+                        help="Phase 35: max fraction of frames manipulated. "
+                             "lo=hi=1.0 = P33 (all frames, no key frame).")
+    parser.add_argument("--insertion_baseline", type=str, default=None,
+                        help="Phase 35 (eval-only): insertion/deletion baseline fill -- "
+                             "blur (P34 headline) | mean | black. Alternate baselines "
+                             "lift the absolute insertion number the blur floor caps. "
+                             "Zero training risk.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

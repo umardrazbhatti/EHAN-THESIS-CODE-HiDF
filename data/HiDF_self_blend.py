@@ -85,18 +85,43 @@ def _soft_blob_mask(b: int, h: int, w: int, lo: float, hi: float,
     return m.unsqueeze(1)                                  # (b, 1, h, w)
 
 
+# Phase 35: artifact MODES -> (use_warp, use_color).  All three composite a
+# modified source under the SAME soft elliptical mask, so the seam-energy target
+# m*(1-m) is valid for every mode; they differ only in HOW the source is altered.
+#   blend = warp + colour  (P33 default; blend-fakes Deepfakes/FaceShifter)
+#   warp  = geometric warp only  (reenactment cue; Face2Face/NeuralTextures)
+#   color = colour/contrast shift only  (graphics-swap cue; FaceSwap)
+_MODE_OPS = {"blend": (True, True), "warp": (True, False), "color": (False, True)}
+
+
 def make_sbi_batch(frames: torch.Tensor,
                    blend_lo: float = 0.25,
-                   blend_hi: float = 0.55):
-    """Generate self-blended pseudo-fakes + boundary targets from REAL clips.
+                   blend_hi: float = 0.55,
+                   modes=("blend",),
+                   partial_lo: float = 1.0,
+                   partial_hi: float = 1.0):
+    """Generate self-blended pseudo-fakes + boundary + frame_mask from REAL clips.
 
     frames : (B, T, C, H, W) float, ImageNet-NORMALISED real clips.
+
+    Phase 35 additions (back-compat: modes=("blend",), partial_lo=hi=1.0 returns
+    the EXACT Phase-33 pseudo-fake):
+      modes       : iterable of artifact families (blend/warp/color); one is
+                    sampled PER CLIP so a batch mixes manipulation types -> the
+                    classifier sees graphics-swap / reenactment cues, not only
+                    blend seams (the cross-dataset fix).
+      partial_lo/hi: fraction of the T frames that carry the artifact, sampled
+                    U[lo,hi] per clip.  <1.0 manipulates only k of T frames, so a
+                    real KEY FRAME exists and the k1/k2/k4 frame-drop test stops
+                    being noise on otherwise temporally-uniform fakes.
+
     Returns:
-        sbi      : (B, T, C, H, W) float (same dtype as input) normalised
-                   pseudo-fake clips with a blend seam.
-        boundary : (B, 1, H, W) float32, non-negative seam-energy map (peaks at
-                   the blend boundary; zero in flat regions).  Feed to
-                   losses.HiDF_explanation.localization_loss together with M_t.
+        sbi        : (B, T, C, H, W) normalised pseudo-fake clips (input dtype).
+        boundary   : (B, 1, H, W) float32 seam-energy map (peaks at the mask edge).
+        frame_mask : (B, T) float32, 1.0 on manipulated frames, 0.0 on the frames
+                     left REAL.  Feed to localization_loss as a per-frame weight so
+                     clean frames are not pulled onto a seam they do not have, and
+                     use it as the temporal-localization target for the k-drop fix.
     """
     B, T, C, H, W = frames.shape
     device = frames.device
@@ -109,26 +134,57 @@ def make_sbi_batch(frames: torch.Tensor,
     x = frames.to(dtype)
     x01 = (x * std + mean).clamp(0.0, 1.0)                 # (B,T,C,H,W) in [0,1]
 
+    # ---- per-clip artifact mode -> use_warp / use_color gates ----------------
+    valid = [m for m in tuple(modes) if m in _MODE_OPS] or ["blend"]
+    midx = torch.randint(len(valid), (B,), device=device)
+    mode_w = torch.tensor([_MODE_OPS[m][0] for m in valid],
+                          device=device, dtype=dtype)       # (n_modes,)
+    mode_c = torch.tensor([_MODE_OPS[m][1] for m in valid],
+                          device=device, dtype=dtype)
+    use_warp  = mode_w[midx].view(B, 1, 1, 1, 1)            # (B,1,1,1,1) in {0,1}
+    use_color = mode_c[midx].view(B, 1, 1, 1, 1)
+
     # ---- warped source (temporally consistent: one grid per clip) -----------
     theta = _rand_affine(B, device, dtype)                # (B,2,3)
     grid = F.affine_grid(theta, size=(B, C, H, W), align_corners=False)  # (B,H,W,2)
     grid = grid.unsqueeze(1).expand(B, T, H, W, 2).reshape(B * T, H, W, 2)
-    src = F.grid_sample(
+    src_warp = F.grid_sample(
         x01.reshape(B * T, C, H, W), grid,
         mode="bilinear", padding_mode="border", align_corners=False,
     ).reshape(B, T, C, H, W)
+    src = use_warp * src_warp + (1.0 - use_warp) * x01    # warp only where selected
 
     # ---- mild colour + contrast shift per clip (statistical seam mismatch) --
     bright = 1.0 + (torch.rand(B, 1, 1, 1, 1, device=device, dtype=dtype) - 0.5) * 0.20
     contrast = 1.0 + (torch.rand(B, 1, 1, 1, 1, device=device, dtype=dtype) - 0.5) * 0.20
     cmean = src.mean(dim=(1, 3, 4), keepdim=True)         # (B,1,C,1,1)
-    src = (((src - cmean) * contrast + cmean) * bright).clamp(0.0, 1.0)
+    src_col = (((src - cmean) * contrast + cmean) * bright).clamp(0.0, 1.0)
+    src = use_color * src_col + (1.0 - use_color) * src   # colour only where selected
 
-    # ---- composite under the soft mask, renormalise -------------------------
+    # ---- composite under the soft mask --------------------------------------
     m = _soft_blob_mask(B, H, W, blend_lo, blend_hi, device, dtype)  # (B,1,H,W)
     m5 = m.unsqueeze(1)                                    # (B,1,1,H,W)
     blended01 = (m5 * src + (1.0 - m5) * x01).clamp(0.0, 1.0)
-    sbi = (blended01 - mean) / std
+
+    # ---- temporally-partial: manipulate only k of T frames ------------------
+    # Sample a per-clip fraction, keep the top-k of a random score per row so the
+    # chosen frames are spread arbitrarily (a clip-specific key frame set).
+    p_lo = float(min(max(partial_lo, 0.0), 1.0))
+    p_hi = float(min(max(partial_hi, p_lo), 1.0))
+    if p_hi >= 1.0 and p_lo >= 1.0:
+        frame_mask = torch.ones(B, T, device=device, dtype=dtype)
+    else:
+        frac   = torch.empty(B, device=device, dtype=dtype).uniform_(p_lo, p_hi)
+        k      = (frac * T).round().clamp(min=1.0, max=float(T)).long()   # (B,)
+        scores = torch.rand(B, T, device=device)
+        order  = scores.argsort(dim=1, descending=True)                  # (B,T)
+        rank   = torch.empty_like(order)
+        rank.scatter_(1, order, torch.arange(T, device=device).expand(B, T))
+        frame_mask = (rank < k.view(B, 1)).to(dtype)                     # (B,T) top-k = 1
+
+    fm5 = frame_mask.view(B, T, 1, 1, 1)
+    final01 = fm5 * blended01 + (1.0 - fm5) * x01         # clean frames stay REAL
+    sbi = (final01 - mean) / std
 
     boundary = m * (1.0 - m)                               # (B,1,H,W) peaks at seam
-    return sbi.to(out_dtype), boundary
+    return sbi.to(out_dtype), boundary, frame_mask
