@@ -271,6 +271,7 @@ def main(config: EAHNConfig):
                        if s.strip()) or ("blend",)
     _sbi_plo   = float(getattr(config, "sbi_partial_frac_lo", 1.0))
     _sbi_phi   = float(getattr(config, "sbi_partial_frac_hi", 1.0))
+    _sbi_freq  = float(getattr(config, "sbi_freq_mismatch", 0.0))
     print(
         f"[Phase33] sbi_enabled={_sbi_enabled}  lambda_localize={_lambda_localize}  "
         f"lambda_sbi_cls={_lambda_sbi_cls}  blend=[{_sbi_lo},{_sbi_hi}]  "
@@ -279,6 +280,10 @@ def main(config: EAHNConfig):
     print(
         f"[Phase35] sbi_modes={list(_sbi_modes)}  partial_frac=[{_sbi_plo},{_sbi_phi}]  "
         f"(modes=cross-dataset artifacts; partial<1.0=key-frame for k-drops)"
+    )
+    print(
+        f"[Phase37] sbi_freq_mismatch={_sbi_freq}  "
+        f"(per-clip downscale-upscale on the blend source = resolution seam cue)"
     )
 
     # ── Phase 34: hard spatial top-k attention bottleneck ─────────────────────
@@ -889,6 +894,7 @@ def main(config: EAHNConfig):
                             blend_lo=_sbi_lo, blend_hi=_sbi_hi,
                             modes=_sbi_modes,                          # Phase 35: artifact families
                             partial_lo=_sbi_plo, partial_hi=_sbi_phi,  # Phase 35: temporally-partial
+                            freq_mismatch=_sbi_freq,                   # Phase 37: resolution seam cue
                         )
                     with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
                         out_sbi       = model(_sbi_frames)

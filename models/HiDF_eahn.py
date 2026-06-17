@@ -433,12 +433,18 @@ class EAHN(nn.Module):
         M_pool = (M_hard - M_flat).detach() + M_flat
         return M_pool, float(kept_mass.mean().item())
 
-    def _decompose(self, Q, M_base):
+    def _decompose(self, Q, M_base, ablate_layer=None):
         """Phase 36: intrinsic multi-layer evidence decomposition.
 
         Q      : (B, T, N, d) transformer features (the representation being pooled).
         M_base : (B, T, h, w) the proven single map (early + refined) — kept as a
                  cold-start anchor in the convex blend so detection is protected.
+        ablate_layer : Phase 36 causal probe (eval-only).  None (training + normal
+                 eval) -> byte-identical.  When set to a layer index k, that
+                 layer's contribution weight is zeroed and the remaining weights
+                 are renormalised (mixture stays convex), so the layer-ablation
+                 self-consistency check can measure how much the fake-confidence
+                 depends on the layer the model itself declared as X%.
 
         Returns:
           M_mix    : (B, T, h, w) convex blend  (1-g)*M_base + g*(sum_k a_k M^k)
@@ -471,6 +477,11 @@ class EAHN(nn.Module):
         pooled  = (Q.unsqueeze(2) * M_layers.unsqueeze(-1)).sum(dim=3)  # (B, T, L, d)
         scores  = self.decomp_weight(pooled).squeeze(-1)               # (B, T, L)
         layer_w = F.softmax(scores, dim=-1)                            # (B, T, L) convex
+        if ablate_layer is not None and 0 <= int(ablate_layer) < self.decomp_layers:
+            keep = torch.ones_like(layer_w)
+            keep[..., int(ablate_layer)] = 0.0
+            layer_w = layer_w * keep
+            layer_w = layer_w / (layer_w.sum(dim=-1, keepdim=True) + 1e-8)
         M_mix_layers = (layer_w.unsqueeze(-1) * M_layers).sum(dim=2)   # (B, T, N) convex
 
         # Cold-start-safe blend with the proven single map (both convex -> convex).
@@ -490,11 +501,16 @@ class EAHN(nn.Module):
         return M_mix, M_layers, layer_w, overlap, float(g.item())
 
     def forward(self, frames: torch.Tensor,
-                lambda_grl: float = 0.0) -> EAHNOutput:
+                lambda_grl: float = 0.0,
+                ablate_layer: int = None) -> EAHNOutput:
         """Phase 27: optional `lambda_grl` controls the GRL strength on the
         DANN domain head.  Default 0.0 keeps Phase-26 behaviour (domain head
         still runs but does NOT pull attn_pool toward invariance).  Training
         script ramps lambda_grl 0 -> lambda_grl_max over domain_warmup_epochs.
+
+        Phase 36: optional `ablate_layer` (eval-only) drops one decomposition
+        layer's contribution for the layer-ablation causal check.  Default None
+        -> byte-identical to the trained forward pass.
         """
         B, T, C, H, W = frames.shape
         frames_flat = frames.reshape(B * T, C, H, W)
@@ -549,7 +565,8 @@ class EAHN(nn.Module):
         # no further wiring.  OFF -> M_t_use unchanged (byte-identical).
         if self.decomp_enabled:
             (M_t_use, _M_layers, _layer_w,
-             _decomp_overlap, _decomp_gate_val) = self._decompose(Q, M_t_use)
+             _decomp_overlap, _decomp_gate_val) = self._decompose(
+                 Q, M_t_use, ablate_layer=ablate_layer)
         else:
             _M_layers, _layer_w = None, None
             _decomp_overlap, _decomp_gate_val = 0.0, 0.0

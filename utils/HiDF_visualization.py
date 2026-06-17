@@ -488,6 +488,88 @@ def save_annotated_frame_strip(
     return output_path
 
 
+# ── save_layer_decomposition_strip (Phase 36) ─────────────────────────────────
+
+def save_layer_decomposition_strip(
+    frame_bgr: np.ndarray,
+    layer_maps: list,
+    layer_weights: list,
+    verdict: str,
+    prob: float,
+    output_path: str,
+    sample_id: str = "",
+) -> str:
+    """Phase 36: render the INTRINSIC multi-layer evidence decomposition.
+
+    The model emits L complementary attention layers in its forward pass, each
+    with a convex contribution weight (the %).  This draws one tile per layer
+    (the layer's time-averaged map over a representative frame, titled with its
+    declared %), ordered biggest-share first, plus a text panel listing the
+    decomposition -- the publishable "Layer 4 = 48% / Layer 2 = 39% ..." figure.
+    Intrinsic by construction: these shares come from the trained forward pass,
+    not a post-hoc attribution.
+
+    frame_bgr     : a single H x W x 3 uint8 BGR frame (representative backdrop).
+    layer_maps    : list of L 2-D float arrays (each a layer's mean-over-time map).
+    layer_weights : list of L floats (convex shares; sum ~ 1).
+    """
+    from PIL import Image as PILImage, ImageDraw, ImageFont
+
+    L = len(layer_maps)
+    if L == 0:
+        return output_path
+    order = sorted(range(L), key=lambda i: float(layer_weights[i]), reverse=True)
+
+    base  = cv2.resize(frame_bgr, (224, 224))
+    tiles = []
+    for li in order:
+        overlay, attn_norm = overlay_heatmap_on_frame(base.copy(), layer_maps[li])
+        bbox = _topk_bbox(attn_norm, percentile=95)
+        if bbox is not None:
+            y0, x0, y1, x1 = bbox
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 255), 1)
+        pct = 100.0 * float(layer_weights[li])
+        cv2.putText(overlay, f"Layer {li + 1}: {pct:.0f}%", (4, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        tiles.append(overlay)
+    strip   = np.hstack(tiles)
+    strip_w = strip.shape[1]
+
+    lines = [
+        f"INTRINSIC EVIDENCE DECOMPOSITION  (verdict: {verdict}, prob={prob:.3f})",
+        "Produced inside the model forward pass (end-to-end trained, not post-hoc).",
+        "",
+    ]
+    for li in order:
+        region = get_region_label(np.asarray(layer_maps[li]))
+        pct    = 100.0 * float(layer_weights[li])
+        lines.append(f"  Layer {li + 1}: {pct:5.1f}%  -> {region}")
+    text = "\n".join(lines)
+
+    line_h, top, left = 17, 10, 10
+    panel_h = len(lines) * line_h + 20
+    panel   = PILImage.new("RGB", (strip_w, panel_h), (20, 20, 20))
+    draw    = ImageDraw.Draw(panel)
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 13)
+    except Exception:
+        font = ImageFont.load_default()
+    vcol = (255, 80, 80) if verdict == "FAKE" else (80, 255, 80)
+    for i, ln in enumerate(lines):
+        draw.text((left, top + i * line_h), ln,
+                  fill=(vcol if i == 0 else (220, 220, 220)), font=font)
+    panel_bgr = cv2.cvtColor(np.array(panel), cv2.COLOR_RGB2BGR)
+    final     = np.vstack([strip, panel_bgr])
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    cv2.imwrite(output_path, final)
+    with open(output_path.replace(".png", "_decomposition.txt"), "w",
+              encoding="utf-8") as f:
+        f.write(text + "\n")
+    return output_path
+
+
 # ── save_explanation_video ────────────────────────────────────────────────────
 
 def save_explanation_video(

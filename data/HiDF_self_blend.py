@@ -99,7 +99,8 @@ def make_sbi_batch(frames: torch.Tensor,
                    blend_hi: float = 0.55,
                    modes=("blend",),
                    partial_lo: float = 1.0,
-                   partial_hi: float = 1.0):
+                   partial_hi: float = 1.0,
+                   freq_mismatch: float = 0.0):
     """Generate self-blended pseudo-fakes + boundary + frame_mask from REAL clips.
 
     frames : (B, T, C, H, W) float, ImageNet-NORMALISED real clips.
@@ -114,6 +115,17 @@ def make_sbi_batch(frames: torch.Tensor,
                     U[lo,hi] per clip.  <1.0 manipulates only k of T frames, so a
                     real KEY FRAME exists and the k1/k2/k4 frame-drop test stops
                     being noise on otherwise temporally-uniform fakes.
+
+    Phase 37 addition (back-compat: freq_mismatch=0.0 returns the EXACT Phase-35
+    pseudo-fake):
+      freq_mismatch: per-clip probability of downscale-then-upscale on the blend
+                    SOURCE before compositing, so the blended region carries a
+                    resolution/frequency discontinuity at the seam.  Real swaps
+                    composite a face from a DIFFERENT generation pipeline (lower
+                    effective resolution) -> a frequency seam is one of the most
+                    transferable cross-dataset cues (Face X-ray).  Our warp+colour
+                    source shares the surround's frequency content, so the seam
+                    lacks this cue; this injects it.  0.0 -> off (byte-identical).
 
     Returns:
         sbi        : (B, T, C, H, W) normalised pseudo-fake clips (input dtype).
@@ -160,6 +172,22 @@ def make_sbi_batch(frames: torch.Tensor,
     cmean = src.mean(dim=(1, 3, 4), keepdim=True)         # (B,1,C,1,1)
     src_col = (((src - cmean) * contrast + cmean) * bright).clamp(0.0, 1.0)
     src = use_color * src_col + (1.0 - use_color) * src   # colour only where selected
+
+    # ---- Phase 37: frequency / resolution mismatch on the source ------------
+    # Per clip (one factor, all T frames -> temporally consistent), downscale
+    # then upscale the source so its high frequencies are destroyed before the
+    # composite, leaving a resolution discontinuity at the seam.  Off by default.
+    if freq_mismatch > 0.0:
+        src = src.clone()
+        for bi in range(B):
+            if float(torch.rand(1).item()) >= float(freq_mismatch):
+                continue
+            fac   = 0.25 + 0.45 * float(torch.rand(1).item())     # in [0.25, 0.70]
+            small = max(8, int(round(H * fac)))
+            down  = F.interpolate(src[bi], size=(small, small),
+                                  mode="bilinear", align_corners=False)
+            src[bi] = F.interpolate(down, size=(H, W),
+                                    mode="bilinear", align_corners=False)
 
     # ---- composite under the soft mask --------------------------------------
     m = _soft_blob_mask(B, H, W, blend_lo, blend_hi, device, dtype)  # (B,1,H,W)

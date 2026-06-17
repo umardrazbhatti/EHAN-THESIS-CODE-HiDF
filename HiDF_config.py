@@ -194,6 +194,10 @@ class EAHNConfig:
     sbi_modes:           str   = "blend"   # comma-list: blend,warp,color
     sbi_partial_frac_lo: float = 1.0       # min fraction of frames manipulated (1.0 = all)
     sbi_partial_frac_hi: float = 1.0       # max fraction; lo=hi=1.0 = P33 (all frames)
+    # Phase 37: per-clip prob of a downscale-upscale on the blend SOURCE so the
+    # seam carries a resolution/frequency discontinuity (Face X-ray cross-dataset
+    # cue our warp+colour source lacks).  0.0 = off (byte-identical to P35).
+    sbi_freq_mismatch:   float = 0.0
     # ── Phase 35: eval-only alternate insertion baseline ──────────────────────
     # The blur baseline floors insertion AUC at ~blurred_conf (~0.32-0.40) no
     # matter how good the map is.  "mean"/"black" give a cleaner sufficiency
@@ -608,6 +612,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sbi_partial_frac_hi", type=float, default=None,
                         help="Phase 35: max fraction of frames manipulated. "
                              "lo=hi=1.0 = P33 (all frames, no key frame).")
+    parser.add_argument("--sbi_freq_mismatch", type=float, default=None,
+                        help="Phase 37: per-clip probability of a downscale-upscale "
+                             "on the self-blend SOURCE, injecting a resolution/"
+                             "frequency seam (Face X-ray cross-dataset cue). "
+                             "0.0 = off (exact P35). Requires --sbi_enabled.")
     parser.add_argument("--insertion_baseline", type=str, default=None,
                         help="Phase 35 (eval-only): insertion/deletion baseline fill -- "
                              "blur (P34 headline) | mean | black. Alternate baselines "

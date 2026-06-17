@@ -320,6 +320,95 @@ class ExplanationMetrics:
         return result
 
     @staticmethod
+    def layer_ablation_causal(model, frames, labels=None, n_samples: int = 50,
+                              chunk: int = 4, verbose: bool = True) -> dict:
+        """Phase 36 causal self-consistency check for the intrinsic decomposition.
+
+        The model DECLARES each evidence layer's contribution as a % via
+        layer_weights (e.g. "Layer 4 = 48%").  This test removes one layer at a
+        time -- model(frames, ablate_layer=k) zeroes that layer's weight and
+        renormalises the rest so the mixture stays convex -- and measures the
+        resulting fake-confidence drop.  A FAITHFUL decomposition shows the
+        declared %-share PREDICTS the drop: removing the layer the model says is
+        48% should cost far more confidence than removing a 5% layer.  This is
+        the intrinsic-safe validation (it probes the model's OWN declared parts,
+        not an external saliency map).
+
+        Returns per-layer declared share + mean drop, the across-sample rank
+        correlation between share and drop, and the rate at which the
+        largest-share layer is also the largest-drop layer (chance = 1/L).
+        Returns {} when the model has no decomposition (decomp_enabled False).
+        """
+        if not getattr(model, "decomp_enabled", False):
+            return {}
+        L = int(getattr(model, "decomp_layers", 0))
+        if L < 2:
+            return {}
+        device = next(model.parameters()).device
+        B = min(n_samples, frames.shape[0])
+        frames = frames[:B]
+        if labels is not None:
+            labels = np.asarray(labels)[:B]
+
+        # Full forward: fake-prob + declared per-layer share (mean over time).
+        prob_full_chunks, share_chunks = [], []
+        with torch.no_grad():
+            for i in range(0, B, chunk):
+                o = model(frames[i:i + chunk].to(device))
+                prob_full_chunks.append(o.prob.detach().cpu())
+                share_chunks.append(o.layer_weights.mean(dim=1).detach().cpu())
+        prob_full = torch.cat(prob_full_chunks).numpy()          # (B,)
+        share     = torch.cat(share_chunks).numpy()              # (B, L)
+
+        # Per-layer ablation: drop = prob_full - prob_with_layer_k_removed.
+        drop = np.zeros((B, L), dtype=np.float64)
+        for k in range(L):
+            pk_chunks = []
+            with torch.no_grad():
+                for i in range(0, B, chunk):
+                    pk_chunks.append(
+                        model(frames[i:i + chunk].to(device),
+                              ablate_layer=k).prob.detach().cpu())
+            drop[:, k] = prob_full - torch.cat(pk_chunks).numpy()
+
+        # Artifact attribution is only well-defined on fakes.
+        if labels is not None and (labels == 1).any():
+            sel = labels == 1
+        else:
+            sel = np.ones(B, dtype=bool)
+        share_s, drop_s = share[sel], drop[sel]
+
+        share_mean = share_s.mean(axis=0)                        # (L,)
+        drop_mean  = drop_s.mean(axis=0)                         # (L,)
+        fs, fd = share_s.flatten(), drop_s.flatten()
+        if np.std(fs) > 1e-9 and np.std(fd) > 1e-9:
+            corr, _ = spearmanr(fs, fd)
+            corr = float(corr) if not np.isnan(corr) else 0.0
+        else:
+            corr = 0.0
+        top_match = float(np.mean(share_s.argmax(axis=1) == drop_s.argmax(axis=1)))
+
+        result = {
+            "n_samples":              int(sel.sum()),
+            "n_layers":               L,
+            "share_per_layer":        [float(x) for x in share_mean],
+            "drop_per_layer":         [float(x) for x in drop_mean],
+            "share_vs_drop_spearman": corr,
+            "top_layer_match_rate":   top_match,
+            "top_layer_match_chance": 1.0 / L,
+        }
+        if verbose:
+            print(f"\n  [Layer-ablation causal check] N={int(sel.sum())} fakes, L={L}")
+            for k in range(L):
+                print(f"    Layer {k + 1}: declared={share_mean[k] * 100:5.1f}%   "
+                      f"conf_drop_when_removed={drop_mean[k]:+.4f}")
+            print(f"    share->drop rank corr = {corr:+.3f}  "
+                  f"(want > 0: bigger declared share => bigger drop)")
+            print(f"    top-share == top-drop layer: {top_match:.2f}  "
+                  f"(chance = {1.0 / L:.2f})")
+        return result
+
+    @staticmethod
     def collapse_diagnostics(all_M_t: torch.Tensor) -> Dict[str, float]:
         """
         Compute three collapse diagnostic metrics on the full test-set M_t tensor.

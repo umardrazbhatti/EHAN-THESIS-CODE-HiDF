@@ -267,6 +267,25 @@ def run_explanation_suite(
     except Exception as e:
         print(f"  [stability_check skipped: {e}]")
 
+    # ── 9b. Layer-ablation causal check (Phase 36 intrinsic decomposition) ────
+    # Remove each declared evidence layer and measure the fake-confidence drop;
+    # a faithful decomposition shows the declared %-share predicts the drop.
+    # This is the intrinsic-safe validation (probes the model's OWN parts).
+    print("[ExplanationSuite] Computing layer-ablation causal check...")
+    layer_causal = {}
+    try:
+        if getattr(model, "decomp_enabled", False):
+            _lc_frames = torch.cat(
+                [frames_by_idx[int(_d)] for _d in di_indices], dim=0)   # (N,T,C,H,W)
+            _lc_labels = [int(all_labels[int(_d)]) if all_labels else 1
+                          for _d in di_indices]
+            layer_causal = ExplanationMetrics.layer_ablation_causal(
+                model, _lc_frames, labels=_lc_labels,
+                n_samples=len(di_indices), chunk=4,
+            )
+    except Exception as e:
+        print(f"  [layer_ablation_causal skipped: {e}]")
+
     # ── Assemble result ───────────────────────────────────────────────────────
     # Phase 28: fake-only del/ins aggregates from the per-sample records
     # (artifact localisation is only well-defined on manipulated samples).
@@ -294,6 +313,7 @@ def run_explanation_suite(
         },
         "frame_attention_drop": drop_results,
         "stability":            stability,
+        "layer_ablation":       layer_causal,
     }
 
     # ── Print summary ─────────────────────────────────────────────────────────
@@ -318,6 +338,17 @@ def run_explanation_suite(
                   f"zerofill={drop_results.get(f'k{k}_ratio_zerofill', 0.0):.3f})")
     if stability:
         print(f"  Stability cosine (mean)  : {stability.get('stability_cosine_mean', 0):.4f}")
+    if layer_causal:
+        _shares = layer_causal.get("share_per_layer", [])
+        _drops  = layer_causal.get("drop_per_layer", [])
+        _share_str = "  ".join(f"L{_i+1}={100*_s:.0f}%" for _i, _s in enumerate(_shares))
+        _drop_str  = "  ".join(f"L{_i+1}={_d:+.3f}"     for _i, _d in enumerate(_drops))
+        print(f"  Layer shares (declared)  : {_share_str}")
+        print(f"  Layer drop-when-removed  : {_drop_str}")
+        print(f"  Share->drop rank corr    : {layer_causal.get('share_vs_drop_spearman', 0):+.3f} "
+              f"(want > 0: declared % predicts causal importance)")
+        print(f"  Top-share==top-drop rate : {layer_causal.get('top_layer_match_rate', 0):.2f} "
+              f"(chance {layer_causal.get('top_layer_match_chance', 0):.2f})")
 
     # ── Save JSON ─────────────────────────────────────────────────────────────
     output_path = Path(output_path)

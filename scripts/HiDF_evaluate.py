@@ -47,6 +47,7 @@ from utils.HiDF_checkpointing import load_checkpoint
 from utils.HiDF_visualization import (
     save_annotated_frame_strip,
     save_explanation_video,
+    save_layer_decomposition_strip,
     overlay_heatmap_on_frame,
     get_region_label,
 )
@@ -1278,6 +1279,22 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
             batch_inter_sample_sim=batch_inter_sample_sim,
             active_manipulation=getattr(config, "active_manipulation", ""),
         )
+
+        # ── Phase 36: intrinsic multi-layer evidence decomposition strip ──────
+        # When the decomposition is active the model returns L per-layer maps +
+        # convex %-weights; render the "Layer k = X%" figure (intrinsic, not
+        # post-hoc).  No-op when decomp is off (M_layers is None).
+        if getattr(out, "M_layers", None) is not None:
+            _ml = out.M_layers[0].mean(dim=0).detach().cpu().numpy()       # (L, N)
+            _lw = out.layer_weights[0].mean(dim=0).detach().cpu().numpy()  # (L,)
+            _Lh = int(round(_ml.shape[1] ** 0.5))
+            _layer_maps = [_ml[k].reshape(_Lh, _Lh) for k in range(_ml.shape[0])]
+            save_layer_decomposition_strip(
+                sampled_orig[len(sampled_orig) // 2], _layer_maps, list(_lw),
+                verdict, prob,
+                os.path.join(heatmap_dir, f"{video_id}_layers.png"),
+                sample_id=video_id,
+            )
 
         # ── Intrinsic explanation video (5f) ──────────────────────────────────
         save_explanation_video(
