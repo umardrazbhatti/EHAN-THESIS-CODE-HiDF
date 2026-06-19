@@ -163,6 +163,19 @@ class EAHNConfig:
     # P33 detection surplus (0.971 vs 0.92 target).  0.0 or >=1.0 = OFF (exact
     # Phase 33, full back-compat).  This is the single Phase-34 sweep axis.
     spatial_topk_frac: float = 0.0     # keep fraction of the 49 spatial cells (SWEEP axis)
+    # ── Phase 38: PRE-transformer hard spatial bottleneck (steep-curve attempt) ─
+    # Diagnosis (6-19-26): spatial_topk_frac bottlenecks the POST-transformer
+    # pooling map, but the temporal transformer has already GLOBALLY MIXED every
+    # token, so the kept cells are not spatially local in the INPUT -- deleting
+    # input pixels cannot track the map and the deletion curve stays flat.
+    # early_topk_frac applies a HARD top-k binary GATE to M_t_early BEFORE the
+    # transformer (on the conv feature map, limited receptive field), so the
+    # prediction is forced through k spatially-local cells and input-pixel
+    # deletion of those cells should crash fake-confidence (a STEEP ROAD curve).
+    # Straight-through estimator backward through the soft map.  Detection cost is
+    # the risk (P30 showed forced concentration can starve the classifier), so
+    # use a moderate keep fraction.  0.0 or >=1.0 = OFF (byte-identical).
+    early_topk_frac: float = 0.0       # keep fraction of cells BEFORE transformer (SWEEP axis)
     # ── Phase 35: DUAL-LENS attention (necessity + sufficiency maps) ──────────
     # P34 verdict (run 6-16-26): the single bottleneck was a NET REGRESSION -- it
     # bought partial sufficiency (ins_gain -0.233 -> -0.123, still <0) at the cost
@@ -586,6 +599,14 @@ def parse_args() -> argparse.Namespace:
                              "compact region and insertion can beat random. Typical "
                              "0.25-0.50. 0.0 or >=1.0 = OFF (Phase 33 behaviour). "
                              "Applies at train AND eval. Single Phase-34 sweep axis.")
+    parser.add_argument("--early_topk_frac", type=float, default=None,
+                        help="Phase 38: PRE-transformer hard spatial bottleneck. "
+                             "Keep ONLY the top fraction of the conv-feature cells "
+                             "as a binary gate BEFORE the temporal transformer "
+                             "(STE backward), forcing the prediction through k "
+                             "spatially-local input regions so input-pixel deletion "
+                             "of those cells crashes fake-confidence (steep ROAD "
+                             "curve).  Typical 0.33-0.50.  0.0 or >=1.0 = OFF.")
     # ── Phase 35: dual-lens attention + enhanced generator + eval baseline ────
     parser.add_argument("--dual_lens_enabled", dest="dual_lens_enabled",
                         action="store_true", default=None,

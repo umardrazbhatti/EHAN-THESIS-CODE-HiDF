@@ -332,6 +332,14 @@ class EAHN(nn.Module):
         # eval).  0.0 or >=1.0 = OFF (exact Phase 33).  Single Phase-34 axis.
         self.spatial_topk_frac = float(getattr(config, "spatial_topk_frac", 0.0))
 
+        # ── Phase 38: PRE-transformer hard spatial bottleneck (steep-curve) ───
+        # A binary top-k gate on M_t_early applied to the conv feature map BEFORE
+        # the temporal transformer (vs spatial_topk_frac, which acts AFTER it on
+        # globally-mixed tokens).  Forces the prediction through k spatially-local
+        # cells so input-pixel deletion of those cells can crash fake-confidence.
+        # 0.0 or >=1.0 = OFF (byte-identical to Phase 33-37 early gate).
+        self.early_topk_frac = float(getattr(config, "early_topk_frac", 0.0))
+
         # ── Phase 35: dual-lens (necessity + sufficiency attention maps) ──────
         # P34 verdict: a single map cannot be both necessary AND sufficient on
         # holistic fakes (proven 4-config sweep).  M_nec = the existing M_t path
@@ -477,9 +485,15 @@ class EAHN(nn.Module):
         pooled  = (Q.unsqueeze(2) * M_layers.unsqueeze(-1)).sum(dim=3)  # (B, T, L, d)
         scores  = self.decomp_weight(pooled).squeeze(-1)               # (B, T, L)
         layer_w = F.softmax(scores, dim=-1)                            # (B, T, L) convex
-        if ablate_layer is not None and 0 <= int(ablate_layer) < self.decomp_layers:
+        if ablate_layer is not None:
+            # Phase 38: accept a single int OR an iterable of layer indices, so the
+            # CUMULATIVE causal check can zero the top-1, top-2, ... layers at once.
+            _abl = ([int(ablate_layer)] if isinstance(ablate_layer, int)
+                    else [int(k) for k in ablate_layer])
             keep = torch.ones_like(layer_w)
-            keep[..., int(ablate_layer)] = 0.0
+            for _k in _abl:
+                if 0 <= _k < self.decomp_layers:
+                    keep[..., _k] = 0.0
             layer_w = layer_w * keep
             layer_w = layer_w / (layer_w.sum(dim=-1, keepdim=True) + 1e-8)
         M_mix_layers = (layer_w.unsqueeze(-1) * M_layers).sum(dim=2)   # (B, T, N) convex
@@ -530,7 +544,30 @@ class EAHN(nn.Module):
         )
         # v4: unpack (softmax map, raw logits, tau scalar)
         M_t_early, M_t_logits, _tau_val = self.early_attn(feats_5d)
-        gate = (M_t_early + self.attn_floor) / (1.0 + self.attn_floor)
+        # ── Phase 38: PRE-transformer hard spatial bottleneck ─────────────────
+        # When early_topk_frac in (0,1): replace the soft floored gate with a HARD
+        # top-k binary gate over the N conv cells (forward = 0/1 mask, backward =
+        # straight-through to the soft map), zeroing all but the top-k cells BEFORE
+        # the temporal transformer.  The prediction is funnelled through k
+        # spatially-local input regions, so deleting those input pixels at eval
+        # crashes fake-confidence (the steep ROAD curve we want).  OFF (0.0/>=1.0)
+        # -> the exact prior soft floored gate (byte-identical to Phase 33-37).
+        _etf = self.early_topk_frac
+        if 0.0 < _etf < 1.0:
+            _Be, _Te, _he, _we = M_t_early.shape
+            _Ne = _he * _we
+            _ke = max(1, int(math.ceil(_etf * _Ne)))
+            if _ke < _Ne:
+                _flat = M_t_early.reshape(_Be, _Te, _Ne)
+                _topi = _flat.topk(_ke, dim=-1).indices
+                _hard = torch.zeros_like(_flat).scatter_(-1, _topi, 1.0)   # binary 0/1
+                _soft = _flat / _flat.amax(dim=-1, keepdim=True).clamp(min=1e-8)
+                _gate_ste = _hard + (_soft - _soft.detach())               # straight-through
+                gate = _gate_ste.reshape(_Be, _Te, _he, _we)
+            else:
+                gate = (M_t_early + self.attn_floor) / (1.0 + self.attn_floor)
+        else:
+            gate = (M_t_early + self.attn_floor) / (1.0 + self.attn_floor)
         spatial_tokens = (
             feats_5d * gate.unsqueeze(2)
         ).reshape(B * T, d, self.feat_h * self.feat_w).permute(0, 2, 1)

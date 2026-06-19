@@ -29,3 +29,4 @@ outputs/
 
 # Face cache
 .face_cache/
+.idea/

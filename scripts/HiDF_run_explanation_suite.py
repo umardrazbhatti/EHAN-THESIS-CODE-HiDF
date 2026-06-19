@@ -222,7 +222,46 @@ def run_explanation_suite(
     _per_sample_path.parent.mkdir(parents=True, exist_ok=True)
     with open(_per_sample_path, "w") as _psf:
         json.dump(per_sample_del_ins, _psf, indent=2)
-    print(f"  [per-sample results saved → {_per_sample_path}]")
+    print(f"  [per-sample results saved -> {_per_sample_path}]")
+
+    # ── 5b. ROAD debiased deletion (Phase 38) ─────────────────────────────────
+    # The blur del/ins above is confounded: a blurred clip reads as MORE fake, so
+    # its curve is flat/non-monotonic no matter the map (the long-standing wall).
+    # ROAD refills removed pixels with NOISY imputation (near-manifold), giving a
+    # MONOTONIC 'relative' curve, and contrasts the intrinsic map ordering with a
+    # GRADIENT ordering (faithful reference) and a RANDOM ordering (floor).
+    print("[ExplanationSuite] Computing ROAD debiased deletion "
+          "(intrinsic / gradient / random orderings)...")
+    road = {}
+    try:
+        _di_list     = [int(d) for d in di_indices]
+        _road_frames = torch.cat([frames_by_idx[d] for d in _di_list], dim=0)
+        _road_labels = [int(all_labels[d]) if all_labels else -1 for d in _di_list]
+        _intrinsic_sal = all_M_t_up_gpu[_di_list].detach().cpu().numpy()      # (Ndi,T,H,W)
+        # Gradient saliency for the SAME clips (the faithful-ordering reference).
+        _grad_sal = []
+        model.eval()
+        for d in _di_list:
+            _ft = frames_by_idx[d].clone().requires_grad_(True)
+            _o  = model(_ft)
+            _o.logit.backward()
+            _grad_sal.append(
+                _ft.grad.abs().mean(dim=2).detach().cpu().numpy()[0])          # (T,H,W)
+            del _ft, _o
+        _grad_sal = np.stack(_grad_sal)                                        # (Ndi,T,H,W)
+        model.eval()
+        road = ExplanationMetrics.road_faithfulness(
+            model, _road_frames,
+            orderings={"intrinsic": _intrinsic_sal,
+                       "gradient":  _grad_sal,
+                       "random":    None},
+            labels=_road_labels, steps=20, chunk=4, verbose=True,
+        )
+        del _road_frames, _grad_sal, _intrinsic_sal
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"  [ROAD skipped: {e}]")
 
     # ── 6. Collapse diagnostics (GPU) ─────────────────────────────────────────
     print("[ExplanationSuite] Computing collapse diagnostics...")
@@ -286,6 +325,26 @@ def run_explanation_suite(
     except Exception as e:
         print(f"  [layer_ablation_causal skipped: {e}]")
 
+    # ── 9c. Layer-ablation CUMULATIVE (Phase 38) ──────────────────────────────
+    # Remove the declared layers one-by-one in decreasing-share order (top-1,
+    # top-1+2, ...) and report the running fake-confidence: a faithful
+    # decomposition drops MONOTONICALLY -- the 'delete 1 layer -> drop, delete 2
+    # -> drop more' readout requested.  Intrinsic-safe (no pixel perturbation).
+    print("[ExplanationSuite] Computing layer-ablation cumulative check...")
+    layer_cumulative = {}
+    try:
+        if getattr(model, "decomp_enabled", False):
+            _lcc_frames = torch.cat(
+                [frames_by_idx[int(_d)] for _d in di_indices], dim=0)
+            _lcc_labels = [int(all_labels[int(_d)]) if all_labels else 1
+                           for _d in di_indices]
+            layer_cumulative = ExplanationMetrics.layer_ablation_cumulative(
+                model, _lcc_frames, labels=_lcc_labels,
+                n_samples=len(di_indices), chunk=4,
+            )
+    except Exception as e:
+        print(f"  [layer_ablation_cumulative skipped: {e}]")
+
     # ── Assemble result ───────────────────────────────────────────────────────
     # Phase 28: fake-only del/ins aggregates from the per-sample records
     # (artifact localisation is only well-defined on manipulated samples).
@@ -314,6 +373,8 @@ def run_explanation_suite(
         "frame_attention_drop": drop_results,
         "stability":            stability,
         "layer_ablation":       layer_causal,
+        "layer_ablation_cumulative": layer_cumulative,
+        "road":                 road,
     }
 
     # ── Print summary ─────────────────────────────────────────────────────────
@@ -349,6 +410,22 @@ def run_explanation_suite(
               f"(want > 0: declared % predicts causal importance)")
         print(f"  Top-share==top-drop rate : {layer_causal.get('top_layer_match_rate', 0):.2f} "
               f"(chance {layer_causal.get('top_layer_match_chance', 0):.2f})")
+    if layer_cumulative:
+        _cd = layer_cumulative.get("cumulative_drop", [])
+        _cd_str = "  ".join(f"-{_i}L={_d:+.3f}" for _i, _d in enumerate(_cd))
+        print(f"  Cumulative layer drop    : {_cd_str}")
+        print(f"  Cumulative monotonic?    : {layer_cumulative.get('monotonic', False)} "
+              f"(want True: each removed layer costs more confidence)")
+    if road:
+        _rand_auc = road.get("random", {}).get("auc", None)
+        for _nm in ("intrinsic", "gradient", "random"):
+            if _nm in road and isinstance(road[_nm], dict):
+                _e = road[_nm]
+                _gain = (_rand_auc - _e["auc"]) if _rand_auc is not None else 0.0
+                _d10 = _e.get("drop_at", {}).get(10, 0.0)
+                _d50 = _e.get("drop_at", {}).get(50, 0.0)
+                print(f"  ROAD {_nm:<9} AUC={_e['auc']:.4f}  gain_vs_rand={_gain:+.4f}  "
+                      f"drop@10%={_d10:+.4f}  drop@50%={_d50:+.4f}")
 
     # ── Save JSON ─────────────────────────────────────────────────────────────
     output_path = Path(output_path)

@@ -328,6 +328,19 @@ def main(config: EAHNConfig):
         f"(intrinsic multi-layer decomposition; combined map replaces M_t downstream)"
     )
 
+    # ── Phase 38: PRE-transformer hard spatial bottleneck (steep-curve axis) ──
+    # Lives in EAHN.forward (binary top-k gate on the conv feature map BEFORE the
+    # transformer).  This just reports config + keep-cell count.  0.0 = OFF.
+    _early_topk   = float(getattr(config, "early_topk_frac", 0.0))
+    _early_active = 0.0 < _early_topk < 1.0
+    _early_k      = (max(1, int(math.ceil(_early_topk * model.N)))
+                     if _early_active else model.N)
+    print(
+        f"[Phase38] early_topk_frac={_early_topk}  active={_early_active}  "
+        f"keep_cells={_early_k}/{model.N}  "
+        f"(PRE-transformer hard gate; STE; forces locally-removable evidence)"
+    )
+
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
     _lambda_sharp = float(getattr(config, "lambda_sharp", 0.15))

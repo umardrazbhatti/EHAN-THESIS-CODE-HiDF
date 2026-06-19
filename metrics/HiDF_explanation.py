@@ -409,6 +409,226 @@ class ExplanationMetrics:
         return result
 
     @staticmethod
+    def road_faithfulness(model, frames, orderings, labels=None, steps: int = 20,
+                          chunk: int = 4, seed: int = 123, noise_scale: float = 1.0,
+                          verbose: bool = True) -> dict:
+        """ROAD-style debiased MoRF deletion faithfulness (Rong et al., ICML 2022).
+
+        WHY THIS EXISTS: the standard deletion/insertion fill (blur / zero / mean)
+        pushes the clip OFF the data manifold.  For this detector a fully-blurred
+        clip reads as MORE fake (measured blurred_conf ~0.82 >> the real
+        baseline), so the blur deletion curve is dominated by that artifact, NOT
+        by evidence removal -- it comes out flat or non-monotonic no matter how
+        good the map is.  ROAD removes pixels with a NOISY imputation instead: the
+        additive noise restores the high-frequency content whose ABSENCE the model
+        was reading as 'blurry => fake', so the perturbed clip stays near the data
+        manifold and the curve becomes MONOTONIC -- removing more evidence lowers
+        fake-confidence proportionally (the 'relative' behaviour we want to read
+        out).  MoRF = Most-Relevant-First: the highest-saliency pixels are removed
+        first, so a faithful ordering produces a STEEPER, LOWER-AUC curve than a
+        random ordering.
+
+        frames    : (B, T, C, H, W) clips (already the eval subset).
+        orderings : dict {name: saliency or None}.  saliency is (B,T,H,W) or
+                    (B,H,W) array/tensor; None = per-sample RANDOM ordering (the
+                    floor every real ordering must beat).
+        labels    : optional (B,) 0/1; when given, a fake-only curve is added.
+
+        Returns dict:
+          baseline_conf, fully_removed_conf{name}  (sanity: fully-removed should
+            fall toward 'real' -- if it RISES the fill is still read as fake),
+          per ordering name -> {"auc","curve","drop_at":{pct:drop},
+                                "auc_fake","drop_at_fake":{pct:drop}}.
+        Lower AUC = more faithful.  gain = auc(random) - auc(name) > 0 => beats
+        random.
+        """
+        device = next(model.parameters()).device
+        B, T, C, H, W = frames.shape
+        frames = frames.to(device)
+        total = H * W
+        if labels is not None:
+            labels = np.asarray(labels)[:B]
+            fake_sel = labels == 1
+        else:
+            fake_sel = np.zeros(B, dtype=bool)
+
+        def _prob1(x):
+            with torch.no_grad():
+                return float(model(x).prob.detach().cpu().reshape(-1)[0])
+
+        baseline_probs = np.zeros(B, dtype=np.float64)
+        with torch.no_grad():
+            for i in range(0, B, chunk):
+                baseline_probs[i:i + chunk] = (
+                    model(frames[i:i + chunk]).prob.detach().cpu().numpy())
+        baseline_conf = float(baseline_probs.mean())
+
+        # Noisy imputation canvas: per-sample, per-channel mean (over T,H,W) plus
+        # Gaussian noise at the per-channel std.  The noise restores the
+        # high-frequency content that a flat/blur fill removes (the thing the
+        # detector mis-reads as 'fake'), keeping the perturbed clip near-manifold.
+        mean_c = frames.mean(dim=(1, 3, 4), keepdim=True)          # (B,1,C,1,1)
+        std_c  = frames.std(dim=(1, 3, 4), keepdim=True)           # (B,1,C,1,1)
+        _g = torch.Generator(device="cpu").manual_seed(seed)
+        noise = torch.randn(frames.shape, generator=_g).to(device)
+        fill_full = mean_c + noise * std_c * float(noise_scale)    # (B,T,C,H,W)
+
+        _rng = np.random.default_rng(seed)
+        try:
+            _trapz = np.trapezoid
+        except AttributeError:
+            _trapz = np.trapz
+
+        def _order_from(sal):
+            s = np.asarray(sal)
+            if s.ndim == 4:            # (B,T,H,W) -> time-average
+                s = s.mean(1)
+            s = s.reshape(B, -1)
+            return np.argsort(s, axis=1)[:, ::-1]                  # descending
+
+        pct_steps = {p: int(round(p / 100.0 * steps)) for p in (0, 10, 25, 50, 75, 100)}
+        result = {"baseline_conf": baseline_conf, "fully_removed_conf": {}}
+
+        for name, sal in orderings.items():
+            if sal is None:
+                order = np.stack([_rng.permutation(total) for _ in range(B)])
+            else:
+                order = _order_from(sal)
+            curve = np.zeros((steps + 1, B), dtype=np.float64)     # per-sample
+            for b in range(B):
+                fb   = frames[b:b + 1]
+                fillb = fill_full[b:b + 1]
+                for step in range(steps + 1):
+                    k = int((step / steps) * total)
+                    if k <= 0:
+                        curve[step, b] = baseline_probs[b]
+                        continue
+                    db = fb.clone()
+                    idx = order[b, :k].copy()
+                    mask = np.zeros(total, dtype=bool)
+                    mask[idx] = True
+                    m2 = mask.reshape(H, W)
+                    db[0, :, :, m2] = fillb[0, :, :, m2]
+                    curve[step, b] = _prob1(db)
+                    del db
+            mean_curve = curve.mean(axis=1)
+            auc = float(_trapz(mean_curve, dx=1.0 / steps))
+            drop_at = {p: float(baseline_conf - mean_curve[s])
+                       for p, s in pct_steps.items() if s < len(mean_curve)}
+            entry = {"auc": auc,
+                     "curve": [float(x) for x in mean_curve],
+                     "drop_at": drop_at}
+            if fake_sel.any():
+                fcurve = curve[:, fake_sel].mean(axis=1)
+                entry["auc_fake"] = float(_trapz(fcurve, dx=1.0 / steps))
+                fbase = float(baseline_probs[fake_sel].mean())
+                entry["drop_at_fake"] = {p: float(fbase - fcurve[s])
+                                         for p, s in pct_steps.items()
+                                         if s < len(fcurve)}
+            result[name] = entry
+            result["fully_removed_conf"][name] = float(mean_curve[-1])
+
+        if verbose:
+            rand_auc = result.get("random", {}).get("auc", None)
+            print(f"\n  [ROAD debiased deletion] N={B} clips, steps={steps}, "
+                  f"baseline_conf={baseline_conf:.4f}")
+            print(f"  {'ordering':>10}  {'AUC':>7}  {'gain_vs_rand':>12}  "
+                  f"{'drop@10%':>9}  {'drop@50%':>9}  {'fully_rmvd':>10}")
+            for name in orderings:
+                e = result[name]
+                gain = (rand_auc - e["auc"]) if rand_auc is not None else 0.0
+                d10 = e["drop_at"].get(10, 0.0)
+                d50 = e["drop_at"].get(50, 0.0)
+                fr  = result["fully_removed_conf"][name]
+                print(f"  {name:>10}  {e['auc']:>7.4f}  {gain:>+12.4f}  "
+                      f"{d10:>+9.4f}  {d50:>+9.4f}  {fr:>10.4f}")
+            print("  (lower AUC = more faithful; gain>0 = beats random; if "
+                  "fully_rmvd does NOT fall below baseline the fill is still "
+                  "read as fake -- raise noise_scale)")
+            print("  (a MONOTONIC drop@10% < drop@50% is the 'relative' "
+                  "behaviour: removing more evidence costs more confidence)")
+        return result
+
+    @staticmethod
+    def layer_ablation_cumulative(model, frames, labels=None, n_samples: int = 50,
+                                  chunk: int = 4, verbose: bool = True) -> dict:
+        """Cumulative version of the layer-ablation causal check (Phase 38).
+
+        layer_ablation_causal removes ONE declared layer at a time.  This removes
+        them CUMULATIVELY in decreasing declared-share order -- top-1, then
+        top-1+2, then top-1+2+3 -- and records the running fake-confidence.  A
+        faithful decomposition shows a MONOTONIC cumulative drop: 'remove the
+        biggest reason -> confidence drops; remove the next -> drops more', which
+        is exactly the layered/relative readout requested ('delete 1 layer ->
+        drop, delete 2 -> more, delete 3 -> more').  Intrinsic-safe (probes the
+        model's OWN declared parts -- no pixel perturbation, so no OOD confound).
+        Returns {} when the model has no decomposition.
+        """
+        if not getattr(model, "decomp_enabled", False):
+            return {}
+        L = int(getattr(model, "decomp_layers", 0))
+        if L < 2:
+            return {}
+        device = next(model.parameters()).device
+        B = min(n_samples, frames.shape[0])
+        frames = frames[:B].to(device)
+        if labels is not None:
+            labels = np.asarray(labels)[:B]
+
+        prob_full_c, share_c = [], []
+        with torch.no_grad():
+            for i in range(0, B, chunk):
+                o = model(frames[i:i + chunk])
+                prob_full_c.append(o.prob.detach().cpu())
+                share_c.append(o.layer_weights.mean(dim=1).detach().cpu())
+        prob_full = torch.cat(prob_full_c).numpy()                # (B,)
+        share     = torch.cat(share_c).numpy()                    # (B, L)
+
+        if labels is not None and (labels == 1).any():
+            sel = labels == 1
+        else:
+            sel = np.ones(B, dtype=bool)
+        mean_share = share[sel].mean(axis=0)                      # (L,)
+        order = np.argsort(mean_share)[::-1]                      # biggest share first
+
+        cum_conf  = [float(prob_full[sel].mean())]
+        cum_share = [0.0]
+        for j in range(1, L):                                     # cannot remove all L
+            abl = [int(x) for x in order[:j]]
+            pj = []
+            with torch.no_grad():
+                for i in range(0, B, chunk):
+                    pj.append(model(frames[i:i + chunk],
+                                    ablate_layer=abl).prob.detach().cpu())
+            pj = torch.cat(pj).numpy()
+            cum_conf.append(float(pj[sel].mean()))
+            cum_share.append(float(mean_share[order[:j]].sum()))
+        drops = [cum_conf[0] - c for c in cum_conf]
+        monotonic = all(drops[i + 1] >= drops[i] - 1e-6 for i in range(len(drops) - 1))
+
+        result = {
+            "n_samples":               int(sel.sum()),
+            "n_layers":                L,
+            "layer_order_by_share":    [int(x) for x in order],
+            "cumulative_removed_share": cum_share,
+            "cumulative_conf":         cum_conf,
+            "cumulative_drop":         drops,
+            "monotonic":               bool(monotonic),
+        }
+        if verbose:
+            print(f"\n  [Layer-ablation CUMULATIVE] N={int(sel.sum())} fakes, L={L}, "
+                  f"removal order (by declared share) = "
+                  f"{[int(x) + 1 for x in order]}")
+            for j in range(L):
+                tag = "full map" if j == 0 else f"top-{j} layers removed"
+                print(f"    {tag:>22}: conf={cum_conf[j]:.4f}  "
+                      f"cum_drop={drops[j]:+.4f}  "
+                      f"(declared share removed={cum_share[j] * 100:4.1f}%)")
+            print(f"    monotonic cumulative drop: {monotonic}  "
+                  f"(want True: each removed layer costs more confidence)")
+        return result
+
+    @staticmethod
     def collapse_diagnostics(all_M_t: torch.Tensor) -> Dict[str, float]:
         """
         Compute three collapse diagnostic metrics on the full test-set M_t tensor.
