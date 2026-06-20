@@ -340,6 +340,14 @@ def main(config: EAHNConfig):
         f"keep_cells={_early_k}/{model.N}  "
         f"(PRE-transformer hard gate; STE; forces locally-removable evidence)"
     )
+    _aeh_on = bool(getattr(config, "aeh_enabled", False))
+    print(
+        f"[Phase39] aeh_enabled={_aeh_on}  "
+        f"warmup_epochs={getattr(config, 'aeh_warmup_epochs', 3)}  "
+        f"lambda_aeh_aux={getattr(config, 'lambda_aeh_aux', 0.5)}  "
+        f"(additive local-evidence head; logit=scale*sum M_frame*M_t*e+bias; "
+        f"faithful by construction; gamma 0->1; M_t_up rebinds to M_t*e)"
+    )
 
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
@@ -494,6 +502,17 @@ def main(config: EAHNConfig):
                     float(getattr(config, "lambda_domain", 0.10)),
                 )
 
+                # ── Phase 39: additive-head blend gamma ramp (0 -> 1) ─────────
+                # Set the model's gamma buffer BEFORE the forward so out_A.logit
+                # uses it.  Ramps over aeh_warmup_epochs (detection-protective: the
+                # proven base head carries the prediction while the additive head
+                # learns), then holds at 1.0 so the FAITHFUL head is the predictor.
+                if getattr(config, "aeh_enabled", False) and hasattr(model, "aeh_gamma_current"):
+                    _aeh_gamma_eff = _faith_warmup(
+                        epoch, int(getattr(config, "aeh_warmup_epochs", 2)),
+                        float(getattr(config, "aeh_gamma_max", 1.0)))
+                    model.aeh_gamma_current.fill_(float(_aeh_gamma_eff))
+
                 # ── Pass A: normal forward (with GRL strength for DANN) ───────
                 out_A    = model(frames, lambda_grl=lam_grl_eff)
                 logits_A = out_A.logit
@@ -503,6 +522,16 @@ def main(config: EAHNConfig):
                 # dual_lens is OFF, so the single-lens path is byte-identical.
                 M_suff   = out_A.M_suff
                 loss_cls = cls_loss_fn(logits_A, labels)
+
+                # ── Phase 39: aux focal-cls on the additive head's own logit ──
+                # Trains aeh_score/scale/bias from epoch 1 even while the blend
+                # gamma is still small, so the faithful head is a competent
+                # classifier by the time gamma reaches 1.0 and it becomes the
+                # sole predictor.  Zero when the head is OFF.
+                if getattr(config, "aeh_enabled", False) and (out_A.aeh_logit is not None):
+                    loss_aeh_aux = cls_loss_fn(out_A.aeh_logit, labels)
+                else:
+                    loss_aeh_aux = torch.zeros((), device=frames.device)
 
                 # Phase 30: B-pass and D-pass ALTERNATE by step parity so the
                 # per-step forward count stays at 2 (A + one bottleneck pass).
@@ -852,7 +881,9 @@ def main(config: EAHNConfig):
                            + _lam_cbm_div            * loss_cbm_div       # Phase 26
                            + _lam_cbm_main_aux       * loss_cbm_main_aux  # Phase 27
                            + lam_dom_eff             * loss_domain        # Phase 27
-                           + _lam_decomp_div         * loss_decomp_div)   # Phase 36
+                           + _lam_decomp_div         * loss_decomp_div    # Phase 36
+                           + float(getattr(config, "lambda_aeh_aux", 0.5))
+                                                     * loss_aeh_aux)      # Phase 39
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))

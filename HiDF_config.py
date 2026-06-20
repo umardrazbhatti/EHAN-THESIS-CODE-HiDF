@@ -241,6 +241,33 @@ class EAHNConfig:
     decomp_gate_init:  float = -0.5         # init of the decomp-vs-single blend gate;
                                             # sigmoid(-0.5)=0.378 -> 62% proven map at
                                             # cold start (detection-protective).
+    # ── Phase 39: additive local-evidence head (faithful-by-construction) ─────
+    # P38 verdict (run 6-20-26): ROAD + cumulative-ablation PROVED the root cause
+    # of the months-long faithfulness wall is ARCHITECTURAL, not a missing loss:
+    # the prediction pools POST-transformer tokens Q, which have a GLOBAL
+    # receptive field, so M_t weights global summaries and removing any region
+    # changes nothing (holographic redundancy; flat deletion/insertion/k-drop).
+    # The ~15 phases of faith/ins/del losses cannot win because every bottleneck
+    # pass re-globalizes through the same backbone+transformer.  Fix: a parallel
+    # head that scores PRE-transformer LOCAL features per cell and forms the logit
+    # as the M_t- and M_frame-weighted SUM of those scores -- so each cell's
+    # contribution is EXACTLY M_frame·M_t·e and deletion/insertion/k-drop/
+    # faithfulness move BY CONSTRUCTION.  A gamma warmup-blend (logit=(1-g)*base+
+    # g*aeh, g:0->1 over aeh_warmup_epochs) protects detection cold-start; at g=1
+    # the faithful head IS the predictor (explanation is not decoration).  The
+    # forward rebinds M_t_up to the contribution map M_t·e, so the eval scores the
+    # faithful saliency with no eval-code change.  aeh_enabled=False = exact Phase
+    # 33-38 (no params, byte-identical).  Single Phase-39 axis.
+    aeh_enabled:        bool  = False       # master switch (Phase 39)
+    aeh_warmup_epochs:  int   = 2           # epochs to ramp the blend gamma 0 -> max
+                                            # (short, so most epochs run at the faithful
+                                            # head -> the best-val checkpoint is faithful)
+    aeh_gamma_max:      float = 1.0         # ramp target.  1.0 = faithful head IS the
+                                            # sole predictor (cleanest, 100% faithful).
+                                            # <1.0 = keep (1-max) of the proven base head
+                                            # for detection (fallback if 1.0 craters AUC).
+    lambda_aeh_aux:     float = 0.5         # aux focal-cls on aeh_logit so the head
+                                            # learns from epoch 1 regardless of gamma
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -667,6 +694,33 @@ def parse_args() -> argparse.Namespace:
                              "and the proven single map. sigmoid(init) = decomposition "
                              "share at cold start. Default -0.5 (0.378 -> 62%% proven "
                              "map, detection-protective).")
+    # ── Phase 39: additive local-evidence head (faithful-by-construction) ──────
+    parser.add_argument("--aeh_enabled", dest="aeh_enabled",
+                        action="store_true", default=None,
+                        help="Phase 39: enable the additive local-evidence head -- "
+                             "scores PRE-transformer local features per cell and forms "
+                             "the logit as scale*sum_t M_frame[t]*sum_n M_t[t,n]*e[t,n]+"
+                             "bias, so each cell's contribution is exactly M_frame*M_t*e "
+                             "and deletion/insertion/k-drop/faithfulness move BY "
+                             "CONSTRUCTION (no global Q to launder the evidence). The "
+                             "eval saliency M_t_up is rebound to the contribution map. "
+                             "OFF = exact Phase 33-38 (no params).")
+    parser.add_argument("--no_aeh", dest="aeh_enabled", action="store_false",
+                        help="Phase 39: disable the additive head (ablation switch).")
+    parser.add_argument("--aeh_warmup_epochs", type=int, default=None,
+                        help="Phase 39: epochs to ramp the detection-protective blend "
+                             "gamma from 0 (base head) to aeh_gamma_max (faithful head). "
+                             "Default 2 (short, so the best-val checkpoint runs at the "
+                             "faithful head).")
+    parser.add_argument("--aeh_gamma_max", type=float, default=None,
+                        help="Phase 39: blend ramp target. 1.0 = the faithful additive "
+                             "head is the SOLE predictor (cleanest, 100%% faithful). "
+                             "<1.0 keeps (1-max) of the proven base head for detection "
+                             "(fallback if 1.0 craters AUC).")
+    parser.add_argument("--lambda_aeh_aux", type=float, default=None,
+                        help="Phase 39: weight on the auxiliary focal-cls loss on "
+                             "aeh_logit, so the additive head trains from epoch 1 "
+                             "regardless of the blend gamma. Default 0.5.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

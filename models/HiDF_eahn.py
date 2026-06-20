@@ -123,6 +123,22 @@ class EAHNOutput:
     layer_weights:   torch.Tensor = None
     decomp_overlap:  float = 0.0
     decomp_gate:     float = 0.0
+    # ── Phase 39: additive local-evidence head (faithful-by-construction) ──────
+    # aeh_logit : (B,) the prediction of the additive head
+    #             logit = scale * Σ_t M_frame[t] · Σ_n M_t[t,n] · e[t,n] + bias,
+    #             where e[t,n] = MLP(PRE-transformer local feature at cell n).
+    #             Each cell's contribution is EXACTLY M_frame·M_t·e, so removing a
+    #             region removes its contribution -> deletion/insertion/k-drop and
+    #             faithfulness move BY CONSTRUCTION (no global Q to launder it).
+    # aeh_gamma : effective blend in the returned logit
+    #             logit = (1-g)*base_logit + g*aeh_logit  (g ramps 0->1 in training,
+    #             g=trained value at eval).  0.0 when the head is OFF.
+    # aeh_sal_up: (B,T,H,W) the per-cell contribution map M_t·e upsampled — the
+    #             FAITHFUL saliency.  When the head is ON the forward rebinds
+    #             M_t_up to this, so every eval ordering metric scores it.
+    aeh_logit:       torch.Tensor = None
+    aeh_gamma:       float = 0.0
+    aeh_sal_up:      torch.Tensor = None
 
 
 class EarlyAttnHead(nn.Module):
@@ -393,6 +409,37 @@ class EAHN(nn.Module):
         else:
             self.decomp_heads = None
 
+        # ── Phase 39: additive local-evidence head (faithful-by-construction) ──
+        # The months-long faithfulness wall has ONE architectural root cause: the
+        # prediction pools POST-transformer tokens Q (forward line ~620), and the
+        # transformer has a GLOBAL receptive field, so each Q[n] is a global
+        # summary -> M_t weights global summaries -> removing any region changes
+        # nothing (holographic redundancy; flat deletion/insertion/k-drop).
+        # Fix: a parallel head that scores PRE-transformer LOCAL features per cell
+        # and forms the logit as the M_t- and M_frame-weighted SUM of those scores:
+        #     e[b,t,n]  = MLP(local_feat[b,t,n])                  (scalar per cell)
+        #     logit_aeh = scale * Σ_t M_frame[t]·Σ_n M_t[t,n]·e[t,n] + bias
+        # Now cell (t,n)'s contribution to the logit is EXACTLY M_frame·M_t·e, so
+        # deletion/insertion/k-drop/faithfulness move because the math forces them.
+        # A gamma warmup-blend (logit = (1-g)*base + g*aeh, g: 0->1) protects
+        # detection cold-start; at g=1 the faithful head IS the predictor, so the
+        # explanation is not decoration.  OFF (default) -> never built, no params,
+        # byte-identical state_dict.  Single Phase-39 axis.
+        self.aeh_enabled = bool(getattr(config, "aeh_enabled", False))
+        if self.aeh_enabled:
+            self.aeh_score = nn.Sequential(
+                nn.LayerNorm(d),
+                nn.Linear(d, max(d // 4, 32)),
+                nn.GELU(),
+                nn.Linear(max(d // 4, 32), 1),
+            )
+            self.aeh_scale = nn.Parameter(torch.tensor(4.0))   # logit dynamic range
+            self.aeh_bias  = nn.Parameter(torch.tensor(0.0))
+            # current blend gamma; set per-epoch by the train loop, read at eval.
+            self.register_buffer("aeh_gamma_current", torch.tensor(0.0))
+        else:
+            self.aeh_score = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -516,7 +563,8 @@ class EAHN(nn.Module):
 
     def forward(self, frames: torch.Tensor,
                 lambda_grl: float = 0.0,
-                ablate_layer: int = None) -> EAHNOutput:
+                ablate_layer: int = None,
+                aeh_gamma: float = None) -> EAHNOutput:
         """Phase 27: optional `lambda_grl` controls the GRL strength on the
         DANN domain head.  Default 0.0 keeps Phase-26 behaviour (domain head
         still runs but does NOT pull attn_pool toward invariance).  Training
@@ -648,6 +696,22 @@ class EAHN(nn.Module):
         M_frame      = F.softmax(frame_logits / _tau_frame, dim=-1)         # (B, T)
         attn_pool    = (attn_pool_per_frame * M_frame.unsqueeze(-1)).sum(dim=1)  # (B, d)
 
+        # ── Phase 39: additive local-evidence head (faithful logit + saliency) ─
+        # local_feat = the PRE-transformer per-cell features (no cross-cell
+        # transformer mixing), so each cell's score is genuinely cell-specific.
+        # aeh_contrib[b,t,n] = M_t[b,t,n]·e[b,t,n] is the per-cell evidence; the
+        # logit is its M_frame-weighted convex sum, scaled.  aeh_sal (= aeh_contrib)
+        # is the FAITHFUL saliency the eval ranks by.
+        if self.aeh_enabled:
+            local_feat  = feats_5d.permute(0, 1, 3, 4, 2).reshape(B, T, N, d)  # (B,T,N,d)
+            _e          = self.aeh_score(local_feat).squeeze(-1)               # (B,T,N)
+            aeh_contrib = M_flat * _e                                          # (B,T,N) cell evidence
+            _frame_sum  = (M_frame.unsqueeze(-1) * aeh_contrib).sum(dim=(1, 2))  # (B,)
+            aeh_logit   = self.aeh_scale * _frame_sum + self.aeh_bias          # (B,)
+            aeh_sal_btn = aeh_contrib                                          # (B,T,N) saliency
+        else:
+            aeh_logit, aeh_sal_btn = None, None
+
         # Phase 25: M_t_up now reflects the REFINED map so the bottleneck
         # construction (loss_ins/loss_faith) and downstream metric code both
         # operate on the same M_t that the classifier consumes.
@@ -655,6 +719,21 @@ class EAHN(nn.Module):
             M_t_use.reshape(B * T, 1, self.feat_h, self.feat_w),
             size=(H, W), mode="bilinear", align_corners=False,
         ).reshape(B, T, H, W)
+
+        # Phase 39: when the additive head is on, the FAITHFUL saliency is the
+        # per-cell contribution M_t·e, not the attention map alone.  Upsample it
+        # and REBIND M_t_up so every eval ordering metric (deletion/insertion/
+        # ROAD/faithfulness) scores the map the predictor actually sums over.
+        # M_t (the softmax attention map) is returned unchanged for the training
+        # losses + viz of WHERE the model looks.
+        if self.aeh_enabled:
+            aeh_sal_up = F.interpolate(
+                aeh_sal_btn.reshape(B * T, 1, self.feat_h, self.feat_w),
+                size=(H, W), mode="bilinear", align_corners=False,
+            ).reshape(B, T, H, W)
+            M_t_up_use = aeh_sal_up
+        else:
+            aeh_sal_up = None
 
         # Phase 35: upsample the sufficiency map for the insertion metric (deletion
         # keeps using M_t_up = necessity).  Aliases M_t_up when single-lens.
@@ -716,6 +795,18 @@ class EAHN(nn.Module):
             cbm_logit, concept_scores, slot_attn, cbm_blend = None, None, None, 0.0
             logit = main_logit
 
+        # ── Phase 39: gamma blend with the faithful additive head ─────────────
+        # logit = (1-g)*base + g*aeh_logit.  g ramps 0->1 over aeh_warmup_epochs
+        # (set on aeh_gamma_current by the train loop); at g=1 the faithful head
+        # IS the predictor, so the explanation metrics score the real decision.
+        # Detection is protected early by the proven base head while g is small.
+        if self.aeh_enabled:
+            _g_aeh = (float(aeh_gamma) if aeh_gamma is not None
+                      else float(self.aeh_gamma_current))
+            logit = (1.0 - _g_aeh) * logit + _g_aeh * aeh_logit
+        else:
+            _g_aeh = 0.0
+
         prob = torch.sigmoid(logit)
 
         # ── Phase 27: DANN domain head ────────────────────────────────────────
@@ -760,4 +851,7 @@ class EAHN(nn.Module):
             layer_weights=_layer_w,
             decomp_overlap=_decomp_overlap,
             decomp_gate=_decomp_gate_val,
+            aeh_logit=aeh_logit,
+            aeh_gamma=_g_aeh,
+            aeh_sal_up=aeh_sal_up,
         )
