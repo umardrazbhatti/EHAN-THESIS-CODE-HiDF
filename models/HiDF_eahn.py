@@ -705,10 +705,16 @@ class EAHN(nn.Module):
         if self.aeh_enabled:
             local_feat  = feats_5d.permute(0, 1, 3, 4, 2).reshape(B, T, N, d)  # (B,T,N,d)
             _e          = self.aeh_score(local_feat).squeeze(-1)               # (B,T,N)
-            aeh_contrib = M_flat * _e                                          # (B,T,N) cell evidence
-            _frame_sum  = (M_frame.unsqueeze(-1) * aeh_contrib).sum(dim=(1, 2))  # (B,)
-            aeh_logit   = self.aeh_scale * _frame_sum + self.aeh_bias          # (B,)
-            aeh_sal_btn = aeh_contrib                                          # (B,T,N) saliency
+            aeh_contrib = M_flat * _e                                          # (B,T,N) signed cell evidence
+            _frame_sum  = (M_frame.unsqueeze(-1) * aeh_contrib).sum(dim=(1, 2))  # (B,) SIGNED sum
+            aeh_logit   = self.aeh_scale * _frame_sum + self.aeh_bias          # (B,) logit unchanged
+            # Eval-facing saliency = POSITIVE (fake-evidence) part of the contribution.
+            # Non-negative so entropy/peakiness/overlays are well-defined and
+            # faithfulness_corr compares magnitude-vs-magnitude (grads are abs()).
+            # ReLU preserves the top-cell ordering deletion/insertion/ROAD rank by
+            # (negative = real-evidence cells tie at 0 -> removed last).  The logit
+            # above keeps the SIGNED sum, so detection is byte-identical.
+            aeh_sal_btn = F.relu(aeh_contrib)                                  # (B,T,N) saliency
         else:
             aeh_logit, aeh_sal_btn = None, None
 

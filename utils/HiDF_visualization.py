@@ -343,6 +343,8 @@ def generate_explanation_text(
     lines.append("")
     lines.append("ATTENTION SCORES PER FRAME:")
     for i, score in enumerate(attention_scores):
+        # Guard NaN/inf/out-of-range scores so a bad saliency can never crash a run.
+        score  = float(np.clip(np.nan_to_num(score, nan=0.0), 0.0, 1.0))
         filled = int(score * 20)
         bar    = "█" * filled + "░" * (20 - filled)
         # Task 1.3: 4 decimal places for verifiability (was .3f → .4f)

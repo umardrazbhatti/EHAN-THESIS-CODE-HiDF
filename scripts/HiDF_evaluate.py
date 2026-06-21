@@ -668,8 +668,13 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
     # ── Mean heatmap entropy (lower = more focused) ───────────────────────────
     def _entropy(m: np.ndarray) -> float:
-        flat = m.flatten().astype(np.float64) + 1e-12
-        flat = flat / flat.sum()
+        # Saliency may be signed (Phase 39 additive head): use magnitude so the
+        # entropy is always well-defined (log needs non-negative, normalized p).
+        flat = np.abs(np.nan_to_num(m.flatten().astype(np.float64)))
+        s = flat.sum()
+        if not np.isfinite(s) or s <= 0:
+            return 0.0
+        flat = flat / s + 1e-12
         return float(-(flat * np.log(flat)).sum())
 
     h_mean = float(np.mean([
@@ -1263,8 +1268,13 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
         intrinsic_maps = [intrinsic[t] for t in range(intrinsic.shape[0])]
 
         def _peakiness(m: np.ndarray) -> float:
-            flat = m.flatten().astype(np.float64) + 1e-12
-            flat = flat / flat.sum()
+            # Saliency may be signed (Phase 39 additive head): use magnitude and
+            # guard zero/NaN sums so the per-frame strip never crashes the run.
+            flat = np.abs(np.nan_to_num(m.flatten().astype(np.float64)))
+            s = flat.sum()
+            if not np.isfinite(s) or s <= 0:
+                return 0.0
+            flat = flat / s + 1e-12
             H_val = -(flat * np.log(flat)).sum()
             return float(1.0 - H_val / np.log(flat.size))
 
