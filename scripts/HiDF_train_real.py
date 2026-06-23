@@ -348,6 +348,15 @@ def main(config: EAHNConfig):
         f"(additive local-evidence head; logit=scale*sum M_frame*M_t*e+bias; "
         f"faithful by construction; gamma 0->1; M_t_up rebinds to M_t*e)"
     )
+    if _aeh_on:
+        print(
+            f"[Phase40] aeh_topk_frac={getattr(config, 'aeh_topk_frac', 0.0)} "
+            f"(EXP-1 hard bottleneck)  "
+            f"lambda_aeh_concentrate={getattr(config, 'lambda_aeh_concentrate', 0.0)}  "
+            f"lambda_aeh_suff={getattr(config, 'lambda_aeh_suff', 0.0)}  "
+            f"aeh_suff_topk_frac={getattr(config, 'aeh_suff_topk_frac', 0.0)} "
+            f"(EXP-2 concentrate evidence -> insertion sufficiency)"
+        )
 
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
@@ -532,6 +541,28 @@ def main(config: EAHNConfig):
                     loss_aeh_aux = cls_loss_fn(out_A.aeh_logit, labels)
                 else:
                     loss_aeh_aux = torch.zeros((), device=frames.device)
+
+                # ── Phase 40: evidence-CONCENTRATION losses (EXP-2) ───────────
+                # (a) concentrate: minimise the entropy of the normalised positive
+                #     contribution ReLU(M_t*e) over cells, on FAKE clips only, so a
+                #     few cells carry the fake-evidence -> insertion SUFFICIENCY.
+                # (b) sufficiency: the top-k% partial logit (aeh_topk_logit) must
+                #     already classify correctly -> trains the insertion objective
+                #     directly.  Both weights 0.0 by default (exact Phase 39).
+                loss_aeh_conc = torch.zeros((), device=frames.device)
+                loss_aeh_suff = torch.zeros((), device=frames.device)
+                if getattr(config, "aeh_enabled", False) and (out_A.aeh_contrib is not None):
+                    if float(getattr(config, "lambda_aeh_concentrate", 0.0)) > 0.0:
+                        _pos  = torch.relu(out_A.aeh_contrib)                 # (B,T,N)
+                        _den  = _pos.sum(dim=2, keepdim=True).clamp_min(1e-6)
+                        _p    = _pos / _den
+                        _ent  = -(_p * (_p + 1e-9).log()).sum(dim=2)         # (B,T)
+                        _entw = (_ent * out_A.M_frame).sum(dim=1)            # (B,) frame-weighted
+                        _fakem = (labels == 1).float()                       # (B,) fake-only
+                        loss_aeh_conc = (_entw * _fakem).sum() / _fakem.sum().clamp_min(1.0)
+                    if (float(getattr(config, "lambda_aeh_suff", 0.0)) > 0.0
+                            and out_A.aeh_topk_logit is not None):
+                        loss_aeh_suff = cls_loss_fn(out_A.aeh_topk_logit, labels)
 
                 # Phase 30: B-pass and D-pass ALTERNATE by step parity so the
                 # per-step forward count stays at 2 (A + one bottleneck pass).
@@ -883,7 +914,11 @@ def main(config: EAHNConfig):
                            + lam_dom_eff             * loss_domain        # Phase 27
                            + _lam_decomp_div         * loss_decomp_div    # Phase 36
                            + float(getattr(config, "lambda_aeh_aux", 0.5))
-                                                     * loss_aeh_aux)      # Phase 39
+                                                     * loss_aeh_aux       # Phase 39
+                           + float(getattr(config, "lambda_aeh_concentrate", 0.0))
+                                                     * loss_aeh_conc      # Phase 40
+                           + float(getattr(config, "lambda_aeh_suff", 0.0))
+                                                     * loss_aeh_suff)     # Phase 40
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
@@ -1202,6 +1237,22 @@ def main(config: EAHNConfig):
                           f"overlap={float(out_A.decomp_overlap):.4f}  "
                           f"layer_w={np.round(_lw0, 3).tolist()}  "
                           f"(gate=decomp share vs single map; layer_w=per-layer evidence %)")
+
+                # ── Phase 39/40: additive-head + concentration diagnostic ─────
+                # top_cell_share = mean over batch of the single largest cell's
+                # share of ReLU(M_t*e) mass.  Rising toward 1 = evidence is
+                # concentrating (what insertion needs); ~1/N = still diffuse.
+                if _aeh_on and (out_A.aeh_contrib is not None):
+                    with torch.no_grad():
+                        _c  = torch.relu(out_A.aeh_contrib)                  # (B,T,N)
+                        _cn = _c / _c.sum(dim=2, keepdim=True).clamp_min(1e-6)
+                        _share = _cn.max(dim=2).values.mean().item()
+                    print(f"[DIAG-P39/40] aeh_gamma={float(out_A.aeh_gamma):.3f}  "
+                          f"L_aeh_aux={loss_aeh_aux.item():.6f}  "
+                          f"L_aeh_conc={loss_aeh_conc.item():.6f}  "
+                          f"L_aeh_suff={loss_aeh_suff.item():.6f}  "
+                          f"top_cell_share={_share:.3f}  "
+                          f"topk_frac={getattr(config, 'aeh_topk_frac', 0.0)}")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:

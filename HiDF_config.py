@@ -268,6 +268,23 @@ class EAHNConfig:
                                             # for detection (fallback if 1.0 craters AUC).
     lambda_aeh_aux:     float = 0.5         # aux focal-cls on aeh_logit so the head
                                             # learns from epoch 1 regardless of gamma
+    # ── Phase 40: evidence-CONCENTRATION knobs on the additive head ────────────
+    # The P39 additive head made deletion/ROAD causal but the learned evidence is
+    # DIFFUSE (peak_mode_share ~0.14 -> top cell holds 14% of mass), so no small
+    # patch is SUFFICIENT and insertion stalls ~0.5.  These concentrate the
+    # per-cell fake-evidence so a few cells become both necessary AND sufficient.
+    # All default 0.0 = exact Phase 39 (byte-identical, no extra compute).
+    aeh_topk_frac:        float = 0.0   # EXP-1: HARD top-k bottleneck on the
+                                        # contribution M_t*e (STE).  >0 -> the head's
+                                        # logit is formed from ONLY the top-k cells per
+                                        # frame, forcing <=k cells to be sufficient by
+                                        # construction (e.g. 0.15 = top ~7 of 49).
+    aeh_suff_topk_frac:   float = 0.0   # EXP-2: top-k fraction for the SOFT sufficiency
+                                        # aux loss (no bottleneck on the prediction).
+    lambda_aeh_concentrate: float = 0.0 # EXP-2: weight on the entropy penalty that
+                                        # concentrates ReLU(M_t*e) over cells (fake-only).
+    lambda_aeh_suff:      float = 0.0   # EXP-2: weight on the focal-cls loss that the
+                                        # top-k% partial logit already crosses the margin.
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -721,6 +738,24 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 39: weight on the auxiliary focal-cls loss on "
                              "aeh_logit, so the additive head trains from epoch 1 "
                              "regardless of the blend gamma. Default 0.5.")
+    # ── Phase 40: evidence-concentration knobs ────────────────────────────────
+    parser.add_argument("--aeh_topk_frac", type=float, default=None,
+                        help="Phase 40 (EXP-1): HARD top-k bottleneck on the additive "
+                             "contribution M_t*e (straight-through). >0 forms the head's "
+                             "logit from ONLY the top-k cells per frame, so <=k cells are "
+                             "sufficient BY CONSTRUCTION -> insertion rises. 0.0 = off "
+                             "(exact Phase 39). e.g. 0.15 = top ~7 of 49 cells.")
+    parser.add_argument("--aeh_suff_topk_frac", type=float, default=None,
+                        help="Phase 40 (EXP-2): top-k fraction for the SOFT sufficiency "
+                             "aux loss (does NOT bottleneck the prediction). 0.0 = off.")
+    parser.add_argument("--lambda_aeh_concentrate", type=float, default=None,
+                        help="Phase 40 (EXP-2): weight on the entropy penalty that "
+                             "concentrates ReLU(M_t*e) over cells (fake samples only). "
+                             "0.0 = off.")
+    parser.add_argument("--lambda_aeh_suff", type=float, default=None,
+                        help="Phase 40 (EXP-2): weight on the focal-cls loss that the "
+                             "top-k%% partial additive logit already crosses the decision "
+                             "margin (trains sufficiency directly). 0.0 = off.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

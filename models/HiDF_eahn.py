@@ -139,6 +139,12 @@ class EAHNOutput:
     aeh_logit:       torch.Tensor = None
     aeh_gamma:       float = 0.0
     aeh_sal_up:      torch.Tensor = None
+    # Phase 40: exposed for the evidence-concentration losses (EXP-2).
+    # aeh_contrib    : (B,T,N) SIGNED per-cell contribution M_t*e (full, no top-k).
+    # aeh_topk_logit : (B,) logit from ONLY the top-k cells (sufficiency readout);
+    #                  None when no top-k fraction is active.
+    aeh_contrib:     torch.Tensor = None
+    aeh_topk_logit:  torch.Tensor = None
 
 
 class EarlyAttnHead(nn.Module):
@@ -437,8 +443,15 @@ class EAHN(nn.Module):
             self.aeh_bias  = nn.Parameter(torch.tensor(0.0))
             # current blend gamma; set per-epoch by the train loop, read at eval.
             self.register_buffer("aeh_gamma_current", torch.tensor(0.0))
+            # Phase 40: evidence-concentration knobs (default 0.0 = exact Phase 39).
+            #   aeh_topk_frac      -> HARD top-k bottleneck on M_t*e (EXP-1).
+            #   aeh_suff_topk_frac -> top-k for the SOFT sufficiency aux loss (EXP-2).
+            self.aeh_topk_frac      = float(getattr(config, "aeh_topk_frac", 0.0))
+            self.aeh_suff_topk_frac = float(getattr(config, "aeh_suff_topk_frac", 0.0))
         else:
             self.aeh_score = None
+            self.aeh_topk_frac      = 0.0
+            self.aeh_suff_topk_frac = 0.0
 
         self._init_weights()
 
@@ -706,17 +719,37 @@ class EAHN(nn.Module):
             local_feat  = feats_5d.permute(0, 1, 3, 4, 2).reshape(B, T, N, d)  # (B,T,N,d)
             _e          = self.aeh_score(local_feat).squeeze(-1)               # (B,T,N)
             aeh_contrib = M_flat * _e                                          # (B,T,N) signed cell evidence
-            _frame_sum  = (M_frame.unsqueeze(-1) * aeh_contrib).sum(dim=(1, 2))  # (B,) SIGNED sum
-            aeh_logit   = self.aeh_scale * _frame_sum + self.aeh_bias          # (B,) logit unchanged
-            # Eval-facing saliency = POSITIVE (fake-evidence) part of the contribution.
+            # Full (all-cell) faithful logit -- the Phase 39 prediction.
+            _frame_sum     = (M_frame.unsqueeze(-1) * aeh_contrib).sum(dim=(1, 2))  # (B,) SIGNED sum
+            aeh_logit_full = self.aeh_scale * _frame_sum + self.aeh_bias       # (B,)
+            # ── Phase 40: top-k partial logit (sufficiency) ───────────────────
+            # Keep only the k most fake-positive cells per frame via a hard mask
+            # with a straight-through gradient (forward = top-k sum; backward =
+            # dense, so every cell still learns and the selection can evolve).
+            # PREDICTION when aeh_topk_frac>0 (EXP-1 hard bottleneck: <=k cells
+            # sufficient BY CONSTRUCTION -> insertion rises); exposed as a
+            # sufficiency aux target when aeh_suff_topk_frac>0 (EXP-2 soft loss).
+            _tk_frac = max(self.aeh_topk_frac, self.aeh_suff_topk_frac)
+            if _tk_frac > 0.0:
+                _k = max(1, int(round(_tk_frac * N)))
+                _topv, _topi = aeh_contrib.topk(_k, dim=2)                     # (B,T,k)
+                _hard      = torch.zeros_like(aeh_contrib).scatter_(2, _topi, 1.0)
+                _contrib_k = aeh_contrib * _hard                              # forward: top-k only
+                _contrib_k = aeh_contrib + (_contrib_k - aeh_contrib).detach()  # STE: dense backward
+                _frame_sum_k   = (M_frame.unsqueeze(-1) * _contrib_k).sum(dim=(1, 2))
+                aeh_topk_logit = self.aeh_scale * _frame_sum_k + self.aeh_bias  # (B,)
+            else:
+                aeh_topk_logit = None
+            # EXP-1: the hard top-k logit IS the head's prediction; else the full sum.
+            aeh_logit = aeh_topk_logit if self.aeh_topk_frac > 0.0 else aeh_logit_full
+            # Eval-facing saliency = POSITIVE (fake-evidence) part of the FULL
+            # contribution (ranks ALL cells; the metric picks its own top-k pixels).
             # Non-negative so entropy/peakiness/overlays are well-defined and
             # faithfulness_corr compares magnitude-vs-magnitude (grads are abs()).
-            # ReLU preserves the top-cell ordering deletion/insertion/ROAD rank by
-            # (negative = real-evidence cells tie at 0 -> removed last).  The logit
-            # above keeps the SIGNED sum, so detection is byte-identical.
             aeh_sal_btn = F.relu(aeh_contrib)                                  # (B,T,N) saliency
         else:
             aeh_logit, aeh_sal_btn = None, None
+            aeh_contrib, aeh_topk_logit = None, None
 
         # Phase 25: M_t_up now reflects the REFINED map so the bottleneck
         # construction (loss_ins/loss_faith) and downstream metric code both
@@ -860,4 +893,6 @@ class EAHN(nn.Module):
             aeh_logit=aeh_logit,
             aeh_gamma=_g_aeh,
             aeh_sal_up=aeh_sal_up,
+            aeh_contrib=aeh_contrib,
+            aeh_topk_logit=aeh_topk_logit,
         )
