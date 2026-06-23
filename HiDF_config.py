@@ -285,6 +285,20 @@ class EAHNConfig:
                                         # concentrates ReLU(M_t*e) over cells (fake-only).
     lambda_aeh_suff:      float = 0.0   # EXP-2: weight on the focal-cls loss that the
                                         # top-k% partial logit already crosses the margin.
+    # Phase 41: SOFT concentration as PURE AUX losses (no forward bottleneck -> no
+    # STE backfire; the dense gamma-blend prediction is untouched, detection-safe).
+    # P40 EXP-1's hard top-k STE bottleneck made evidence MORE diffuse (the dense
+    # backward let the model equalise cells to game the mask); these replace it.
+    # All default 0.0 = exact Phase 39/40 (byte-identical, no extra compute).
+    lambda_aeh_topk_mass:   float = 0.0 # weight: maximise the share of the top-k cells
+                                        # in the normalised ReLU(M_t*e) distribution
+                                        # (fake-only) -> few cells SUFFICIENT (insertion up,
+                                        # deletion down) WITHOUT bottlenecking the logit.
+    aeh_mass_topk_frac:     float = 0.15# top-k fraction for lambda_aeh_topk_mass
+                                        # (0.15 = top ~7 of 49 cells).
+    lambda_aeh_temporal_conc: float = 0.0 # weight: concentrate M_frame over frames
+                                        # (entropy, fake-only) -> a few frames carry the
+                                        # evidence -> sharper top-K frame-drop (k-drops).
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -756,6 +770,18 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 40 (EXP-2): weight on the focal-cls loss that the "
                              "top-k%% partial additive logit already crosses the decision "
                              "margin (trains sufficiency directly). 0.0 = off.")
+    parser.add_argument("--lambda_aeh_topk_mass", type=float, default=None,
+                        help="Phase 41: weight to MAXIMISE the share of the top-k cells in "
+                             "the normalised ReLU(M_t*e) distribution (fake samples only). "
+                             "Pure aux loss (prediction NOT bottlenecked) -> concentrates "
+                             "evidence so few cells are sufficient. 0.0 = off.")
+    parser.add_argument("--aeh_mass_topk_frac", type=float, default=None,
+                        help="Phase 41: top-k fraction for --lambda_aeh_topk_mass "
+                             "(0.15 = top ~7 of 49 cells).")
+    parser.add_argument("--lambda_aeh_temporal_conc", type=float, default=None,
+                        help="Phase 41: weight to concentrate M_frame over frames "
+                             "(entropy, fake samples only) -> a few frames carry the "
+                             "evidence, sharpening the top-K frame-drop test. 0.0 = off.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

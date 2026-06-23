@@ -357,6 +357,13 @@ def main(config: EAHNConfig):
             f"aeh_suff_topk_frac={getattr(config, 'aeh_suff_topk_frac', 0.0)} "
             f"(EXP-2 concentrate evidence -> insertion sufficiency)"
         )
+        print(
+            f"[Phase41] lambda_aeh_topk_mass={getattr(config, 'lambda_aeh_topk_mass', 0.0)}  "
+            f"aeh_mass_topk_frac={getattr(config, 'aeh_mass_topk_frac', 0.15)}  "
+            f"lambda_aeh_temporal_conc={getattr(config, 'lambda_aeh_temporal_conc', 0.0)}  "
+            f"(SOFT concentration as PURE AUX losses; prediction NOT bottlenecked; "
+            f"replaces P40 EXP-1 hard top-k which backfired -> more diffuse)"
+        )
 
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
@@ -563,6 +570,38 @@ def main(config: EAHNConfig):
                     if (float(getattr(config, "lambda_aeh_suff", 0.0)) > 0.0
                             and out_A.aeh_topk_logit is not None):
                         loss_aeh_suff = cls_loss_fn(out_A.aeh_topk_logit, labels)
+
+                # ── Phase 41: SOFT concentration as PURE AUX losses ───────────
+                # Replaces P40 EXP-1's hard top-k STE bottleneck (which made
+                # evidence MORE diffuse — the dense backward let the model
+                # equalise cells to game the mask).  These add gradient pressure
+                # on the M_t*e / M_frame DISTRIBUTIONS without touching the dense
+                # prediction, so detection (the gamma-blend logit) is unchanged.
+                # (a) spatial top-k mass: maximise the share of the top-k cells in
+                #     the normalised ReLU(M_t*e) -> few cells SUFFICIENT.  Cannot be
+                #     gamed by equalising (uniform -> top-k mass = k/N, the MINIMUM).
+                # (b) temporal concentration: minimise M_frame entropy over frames
+                #     -> a few frames carry the evidence (sharper k-drop).  All
+                #     fake-gated; weights 0.0 by default = exact Phase 39/40.
+                loss_aeh_mass  = torch.zeros((), device=frames.device)
+                loss_aeh_tconc = torch.zeros((), device=frames.device)
+                if getattr(config, "aeh_enabled", False) and (out_A.aeh_contrib is not None):
+                    _fakem = (labels == 1).float()                       # (B,) fake-only
+                    _fden  = _fakem.sum().clamp_min(1.0)
+                    if float(getattr(config, "lambda_aeh_topk_mass", 0.0)) > 0.0:
+                        _posm = torch.relu(out_A.aeh_contrib)            # (B,T,N)
+                        _Nn   = _posm.shape[2]
+                        _kk   = max(1, int(round(
+                            float(getattr(config, "aeh_mass_topk_frac", 0.15)) * _Nn)))
+                        _pm   = _posm / _posm.sum(dim=2, keepdim=True).clamp_min(1e-6)
+                        _tkm  = _pm.topk(_kk, dim=2).values.sum(dim=2)   # (B,T) top-k share
+                        _tkmw = (_tkm * out_A.M_frame).sum(dim=1)        # (B,) frame-weighted
+                        loss_aeh_mass = ((1.0 - _tkmw) * _fakem).sum() / _fden
+                    if float(getattr(config, "lambda_aeh_temporal_conc", 0.0)) > 0.0:
+                        _mf   = out_A.M_frame.clamp_min(1e-6)            # (B,T)
+                        _mfp  = _mf / _mf.sum(dim=1, keepdim=True)
+                        _tent = -(_mfp * (_mfp + 1e-9).log()).sum(dim=1) # (B,)
+                        loss_aeh_tconc = (_tent * _fakem).sum() / _fden
 
                 # Phase 30: B-pass and D-pass ALTERNATE by step parity so the
                 # per-step forward count stays at 2 (A + one bottleneck pass).
@@ -918,7 +957,11 @@ def main(config: EAHNConfig):
                            + float(getattr(config, "lambda_aeh_concentrate", 0.0))
                                                      * loss_aeh_conc      # Phase 40
                            + float(getattr(config, "lambda_aeh_suff", 0.0))
-                                                     * loss_aeh_suff)     # Phase 40
+                                                     * loss_aeh_suff      # Phase 40
+                           + float(getattr(config, "lambda_aeh_topk_mass", 0.0))
+                                                     * loss_aeh_mass      # Phase 41
+                           + float(getattr(config, "lambda_aeh_temporal_conc", 0.0))
+                                                     * loss_aeh_tconc)    # Phase 41
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
@@ -1244,15 +1287,22 @@ def main(config: EAHNConfig):
                 # concentrating (what insertion needs); ~1/N = still diffuse.
                 if _aeh_on and (out_A.aeh_contrib is not None):
                     with torch.no_grad():
-                        _c  = torch.relu(out_A.aeh_contrib)                  # (B,T,N)
-                        _cn = _c / _c.sum(dim=2, keepdim=True).clamp_min(1e-6)
+                        _c   = torch.relu(out_A.aeh_contrib)                 # (B,T,N)
+                        _cn  = _c / _c.sum(dim=2, keepdim=True).clamp_min(1e-6)
                         _share = _cn.max(dim=2).values.mean().item()
-                    print(f"[DIAG-P39/40] aeh_gamma={float(out_A.aeh_gamma):.3f}  "
+                        # share of the top-k (~7/49) cells = what insertion needs
+                        _km  = max(1, int(round(
+                            float(getattr(config, "aeh_mass_topk_frac", 0.15))
+                            * _cn.shape[2])))
+                        _tkshare = _cn.topk(_km, dim=2).values.sum(dim=2).mean().item()
+                    print(f"[DIAG-P39/40/41] aeh_gamma={float(out_A.aeh_gamma):.3f}  "
                           f"L_aeh_aux={loss_aeh_aux.item():.6f}  "
                           f"L_aeh_conc={loss_aeh_conc.item():.6f}  "
                           f"L_aeh_suff={loss_aeh_suff.item():.6f}  "
+                          f"L_aeh_mass={loss_aeh_mass.item():.6f}  "
+                          f"L_aeh_tconc={loss_aeh_tconc.item():.6f}  "
                           f"top_cell_share={_share:.3f}  "
-                          f"topk_frac={getattr(config, 'aeh_topk_frac', 0.0)}")
+                          f"top{_km}_share={_tkshare:.3f}")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
