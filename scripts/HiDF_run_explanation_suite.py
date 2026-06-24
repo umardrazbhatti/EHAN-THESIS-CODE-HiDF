@@ -155,74 +155,99 @@ def run_explanation_suite(
     torch.cuda.empty_cache()
 
     # ── 5. Deletion / Insertion AUC (GPU-resident frames + saliency) ──────────
-    print("[ExplanationSuite] Computing deletion/insertion AUC "
-          f"(N={N_DEL_INS}, steps=20, with random-saliency control)...")
-    per_sample_del_ins = []
-    _del_aucs = []
-    _ins_aucs = []
-    _ins_gains = []       # Phase 28: gain of M_t ordering over random ordering
-    _del_gains = []
+    # Phase 42: report del/ins under EACH baseline in config.insertion_baselines.
+    # The blur fill is confounded -- a blurred clip reads as MORE fake, so the
+    # insertion curve is floored/non-monotonic regardless of map quality (proven
+    # P38/P41).  black/mean are flat baselines that give a cleaner sufficiency
+    # readout.  The FIRST listed baseline is the HEADLINE: its aggregates fill the
+    # canonical keys (back-compat) and its per-sample rows are saved.  Every
+    # baseline is ALSO stored under result["del_ins_baselines"][<name>].  When
+    # insertion_baselines is unset/single, this reproduces the prior result exactly.
+    _bl_raw = str(getattr(config, "insertion_baselines", "") or "").strip()
+    if _bl_raw:
+        _baselines = [b.strip() for b in _bl_raw.split(",") if b.strip()]
+    else:
+        _baselines = [str(getattr(config, "insertion_baseline", "blur"))]
+    _seen = set()
+    _baselines = [b for b in _baselines if not (b in _seen or _seen.add(b))]
+    _headline_bl = _baselines[0]
+    print(f"[ExplanationSuite] Computing deletion/insertion AUC "
+          f"(N={N_DEL_INS}, steps=20, random-control; baselines={_baselines})...")
 
-    for _si, _di in enumerate(di_indices):
-        _di = int(_di)
-        _f_s = frames_by_idx[_di]                                  # (1, T, C, H, W) GPU
-        _s_s = all_M_t_up_gpu[_di:_di+1].detach().cpu().numpy()    # necessity (deletion)
-        # Phase 35: insertion ranks by the sufficiency lens (= M_t when single-lens,
-        # so non-dual runs reproduce the exact prior insertion result).
-        _su  = all_M_suff_up_gpu if all_M_suff_up_gpu is not None else all_M_t_up_gpu
-        _s_ins = _su[_di:_di+1].detach().cpu().numpy()
-        _prob_s  = float(all_probs[_di])
-        _label_s = int(all_labels[_di]) if all_labels else -1
-        _vpath_s = str(all_vid_paths[_di]) if all_vid_paths else ""
-        _di_result = ExplanationMetrics.deletion_insertion_auc(
-            model, _f_s, _s_s, steps=20, n_samples=1,
-            random_control=True, verbose=False,
-            saliency_ins=_s_ins,
-            baseline=str(getattr(config, "insertion_baseline", "blur")),
-        )
-        _d_auc = float(_di_result.get("deletion_auc", 0.0))
-        _i_auc = float(_di_result.get("insertion_auc", 0.0))
-        _i_gain = float(_di_result.get("ins_gain_over_random", 0.0))
-        _d_gain = float(_di_result.get("del_gain_over_random", 0.0))
-        _del_aucs.append(_d_auc)
-        _ins_aucs.append(_i_auc)
-        _ins_gains.append(_i_gain)
-        _del_gains.append(_d_gain)
-        _mt_std_s   = float(all_M_t_up_gpu[_di].std().item())
-        _faith_s    = _i_auc - _d_auc
-        per_sample_del_ins.append({
-            "video_path":       _vpath_s,
-            "label":            _label_s,
-            "prob":             _prob_s,
-            "deletion_auc":     _d_auc,
-            "insertion_auc":    _i_auc,
-            "ins_gain_over_random": _i_gain,
-            "del_gain_over_random": _d_gain,
-            "m_t_std":          _mt_std_s,
-            "faithfulness_score": _faith_s,
-        })
-        print(f"  [del/ins AUC sample {_si+1}/{N_DEL_INS}]  "
-              f"del={_d_auc:.4f}  ins={_i_auc:.4f}  "
-              f"ins_gain={_i_gain:+.4f}  del_gain={_d_gain:+.4f}")
-        # Per-sample VRAM hygiene — del/ins clones full (T,C,H,W) per step
-        torch.cuda.empty_cache()
+    def _run_del_ins_for_baseline(_bl, _headline=False):
+        """Run the per-clip del/ins loop for one canvas baseline; return (agg, rows)."""
+        _da, _ia, _ig, _dg = [], [], [], []
+        _rows = []
+        for _si, _di in enumerate(di_indices):
+            _di = int(_di)
+            _f_s   = frames_by_idx[_di]                               # (1,T,C,H,W) GPU
+            _s_s   = all_M_t_up_gpu[_di:_di+1].detach().cpu().numpy() # necessity (deletion)
+            # Insertion ranks by the sufficiency lens (= M_t when single-lens).
+            _su    = all_M_suff_up_gpu if all_M_suff_up_gpu is not None else all_M_t_up_gpu
+            _s_ins = _su[_di:_di+1].detach().cpu().numpy()
+            _prob_s  = float(all_probs[_di])
+            _label_s = int(all_labels[_di]) if all_labels else -1
+            _vpath_s = str(all_vid_paths[_di]) if all_vid_paths else ""
+            _di_result = ExplanationMetrics.deletion_insertion_auc(
+                model, _f_s, _s_s, steps=20, n_samples=1,
+                random_control=True, verbose=False,
+                saliency_ins=_s_ins, baseline=str(_bl),
+            )
+            _d_auc  = float(_di_result.get("deletion_auc", 0.0))
+            _i_auc  = float(_di_result.get("insertion_auc", 0.0))
+            _i_gain = float(_di_result.get("ins_gain_over_random", 0.0))
+            _d_gain = float(_di_result.get("del_gain_over_random", 0.0))
+            _da.append(_d_auc); _ia.append(_i_auc); _ig.append(_i_gain); _dg.append(_d_gain)
+            _rows.append({
+                "video_path":       _vpath_s,
+                "label":            _label_s,
+                "prob":             _prob_s,
+                "deletion_auc":     _d_auc,
+                "insertion_auc":    _i_auc,
+                "ins_gain_over_random": _i_gain,
+                "del_gain_over_random": _d_gain,
+                "m_t_std":          float(all_M_t_up_gpu[_di].std().item()),
+                "faithfulness_score": _i_auc - _d_auc,
+            })
+            if _headline:
+                print(f"  [del/ins {_bl} sample {_si+1}/{N_DEL_INS}]  "
+                      f"del={_d_auc:.4f}  ins={_i_auc:.4f}  "
+                      f"ins_gain={_i_gain:+.4f}  del_gain={_d_gain:+.4f}")
+            # Per-sample VRAM hygiene -- del/ins clones full (T,C,H,W) per step
+            torch.cuda.empty_cache()
+        _fake = [r for r in _rows if r.get("label", -1) == 1]
+        _agg = {
+            "deletion_auc":            float(np.mean(_da)) if _da else 0.0,
+            "insertion_auc":           float(np.mean(_ia)) if _ia else 0.0,
+            "ins_gain_over_random":    float(np.mean(_ig)) if _ig else 0.0,
+            "del_gain_over_random":    float(np.mean(_dg)) if _dg else 0.0,
+            "deletion_auc_fake_only":  float(np.mean([r["deletion_auc"]  for r in _fake])) if _fake else 0.0,
+            "insertion_auc_fake_only": float(np.mean([r["insertion_auc"] for r in _fake])) if _fake else 0.0,
+            "n_fake":                  len(_fake),
+        }
+        print(f"  [del/ins {_bl} aggregate N={N_DEL_INS}]  "
+              f"del={_agg['deletion_auc']:.4f}  ins={_agg['insertion_auc']:.4f}  "
+              f"del_fake={_agg['deletion_auc_fake_only']:.4f}  "
+              f"ins_fake={_agg['insertion_auc_fake_only']:.4f}  "
+              f"ins_gain={_agg['ins_gain_over_random']:+.4f}  "
+              f"del_gain={_agg['del_gain_over_random']:+.4f}")
+        return _agg, _rows
 
-    del_ins = {
-        "deletion_auc":  float(np.mean(_del_aucs)) if _del_aucs else 0.0,
-        "insertion_auc": float(np.mean(_ins_aucs)) if _ins_aucs else 0.0,
-        "ins_gain_over_random": float(np.mean(_ins_gains)) if _ins_gains else 0.0,
-        "del_gain_over_random": float(np.mean(_del_gains)) if _del_gains else 0.0,
-    }
-    print(f"  [del/ins AUC aggregate N={N_DEL_INS}]  "
-          f"del={del_ins['deletion_auc']:.4f}  ins={del_ins['insertion_auc']:.4f}  "
-          f"ins_gain_over_random={del_ins['ins_gain_over_random']:+.4f}  "
-          f"del_gain_over_random={del_ins['del_gain_over_random']:+.4f}")
+    del_ins_by_baseline = {}
+    per_sample_del_ins  = []
+    del_ins             = {}
+    for _bl in _baselines:
+        _agg, _rows = _run_del_ins_for_baseline(_bl, _headline=(_bl == _headline_bl))
+        del_ins_by_baseline[_bl] = _agg
+        if _bl == _headline_bl:
+            del_ins            = _agg
+            per_sample_del_ins = _rows
 
     _per_sample_path = Path("outputs") / "explanation_per_sample.json"
     _per_sample_path.parent.mkdir(parents=True, exist_ok=True)
     with open(_per_sample_path, "w") as _psf:
         json.dump(per_sample_del_ins, _psf, indent=2)
-    print(f"  [per-sample results saved -> {_per_sample_path}]")
+    print(f"  [per-sample results ({_headline_bl}) saved -> {_per_sample_path}]")
 
     # ── 5b. ROAD debiased deletion (Phase 38) ─────────────────────────────────
     # The blur del/ins above is confounded: a blurred clip reads as MORE fake, so
@@ -375,6 +400,9 @@ def run_explanation_suite(
         "layer_ablation":       layer_causal,
         "layer_ablation_cumulative": layer_cumulative,
         "road":                 road,
+        # Phase 42: del/ins under every requested baseline (blur/black/mean).
+        # The canonical intrinsic.{deletion,insertion}_auc above = headline (first).
+        "del_ins_baselines":    del_ins_by_baseline,
     }
 
     # ── Print summary ─────────────────────────────────────────────────────────
@@ -387,6 +415,15 @@ def run_explanation_suite(
     print(f"  Del gain over random     : {result['intrinsic']['del_gain_over_random']:+.4f}")
     print(f"  Del/Ins AUC (fake only)  : {result['intrinsic']['deletion_auc_fake_only']:.3f} / "
           f"{result['intrinsic']['insertion_auc_fake_only']:.3f}")
+    if len(del_ins_by_baseline) > 1:
+        print("  --- del/ins by baseline (Phase 42; blur is confounded) ---")
+        print(f"    {'baseline':<8} {'del':>7} {'ins':>7} {'del_fake':>9} {'ins_fake':>9} "
+              f"{'ins_gain':>9} {'del_gain':>9}")
+        for _bl in _baselines:
+            _a = del_ins_by_baseline[_bl]
+            print(f"    {_bl:<8} {_a['deletion_auc']:>7.3f} {_a['insertion_auc']:>7.3f} "
+                  f"{_a['deletion_auc_fake_only']:>9.3f} {_a['insertion_auc_fake_only']:>9.3f} "
+                  f"{_a['ins_gain_over_random']:>+9.4f} {_a['del_gain_over_random']:>+9.4f}")
     print(f"  Inter-sample cosine      : {result['intrinsic']['inter_sample_cos_mean']:.3f}")
     print(f"  Peak mode share          : {result['intrinsic']['peak_mode_share']:.3f}")
     print(f"  M_t std mean             : {result['intrinsic']['m_t_std_mean']:.4f}")

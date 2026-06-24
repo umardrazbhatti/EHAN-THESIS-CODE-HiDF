@@ -206,8 +206,9 @@ def main(config: EAHNConfig):
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config.epochs, eta_min=1e-6
-    )
+        optimizer, T_max=max(int(config.epochs), 1), eta_min=1e-6
+    )  # Phase 42: max(.,1) so eval-only runs (--epochs 0 + --resume_checkpoint)
+       # construct the scheduler without a divide-by-zero in get_lr.
 
     _use_amp = (
         config.use_amp

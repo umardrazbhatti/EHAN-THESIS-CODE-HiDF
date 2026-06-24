@@ -216,6 +216,15 @@ class EAHNConfig:
     # matter how good the map is.  "mean"/"black" give a cleaner sufficiency
     # readout.  Eval-only, zero training risk.  "blur" = exact P34 headline.
     insertion_baseline:  str   = "blur"    # blur | mean | black
+    # ── Phase 42: report del/ins under SEVERAL baselines in one eval pass ──────
+    # The blur fill is confounded (a blurred clip reads as MORE fake, so the
+    # insertion curve is floored/non-monotonic no matter the map -- proven in
+    # P38/P41: ins@10% > ins@50%).  Reporting blur + black + mean side-by-side
+    # shows which baseline the intrinsic map wins under, without picking one by
+    # hand.  Comma-separated; "" or single value reproduces the prior single
+    # headline exactly.  Eval-only, ZERO training risk.  Headline key stays the
+    # first listed baseline (default "blur" = byte-identical to pre-P42).
+    insertion_baselines: str   = "blur"    # e.g. "blur,black,mean"
     # ── Phase 36: intrinsic multi-layer evidence DECOMPOSITION ────────────────
     # P35 verdict: a single (or dual) compact map cannot be both necessary AND
     # sufficient on HOLISTIC fakes -- the whole face is regenerated, so the
@@ -701,6 +710,11 @@ def parse_args() -> argparse.Namespace:
                              "blur (P34 headline) | mean | black. Alternate baselines "
                              "lift the absolute insertion number the blur floor caps. "
                              "Zero training risk.")
+    parser.add_argument("--insertion_baselines", type=str, default=None,
+                        help="Phase 42 (eval-only): comma-separated list of del/ins "
+                             "baselines to report together, e.g. 'blur,black,mean'. The "
+                             "blur fill is confounded; this shows which baseline the map "
+                             "wins under. Headline keys = first listed. Zero training risk.")
     # ── Phase 36: intrinsic multi-layer evidence decomposition ────────────────
     parser.add_argument("--decomp_enabled", dest="decomp_enabled",
                         action="store_true", default=None,
