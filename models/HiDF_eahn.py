@@ -433,11 +433,26 @@ class EAHN(nn.Module):
         # byte-identical state_dict.  Single Phase-39 axis.
         self.aeh_enabled = bool(getattr(config, "aeh_enabled", False))
         if self.aeh_enabled:
+            # Phase 43: optional SRM spectral branch.  Its 7x7 features are
+            # concatenated into the per-cell evidence -> aeh_score reads (d+dfreq).
+            # OFF -> aeh_score reads d (byte-identical Phase 39 state_dict).
+            self.aeh_freq_enabled = bool(getattr(config, "aeh_freq_enabled", False))
+            if self.aeh_freq_enabled:
+                self.aeh_freq_dim = int(getattr(config, "aeh_freq_dim", 32))
+                self.register_buffer("aeh_srm_w", self._srm_kernels())   # (3,3,5,5) fixed
+                self.aeh_freq_cnn = nn.Sequential(
+                    nn.Conv2d(3, 16, 5, stride=4, padding=2), nn.GELU(),               # /4
+                    nn.Conv2d(16, self.aeh_freq_dim, 3, stride=2, padding=1), nn.GELU(),  # /2
+                )
+                _aeh_in = d + self.aeh_freq_dim
+            else:
+                self.aeh_freq_dim = 0
+                _aeh_in = d
             self.aeh_score = nn.Sequential(
-                nn.LayerNorm(d),
-                nn.Linear(d, max(d // 4, 32)),
+                nn.LayerNorm(_aeh_in),
+                nn.Linear(_aeh_in, max(_aeh_in // 4, 32)),
                 nn.GELU(),
-                nn.Linear(max(d // 4, 32), 1),
+                nn.Linear(max(_aeh_in // 4, 32), 1),
             )
             self.aeh_scale = nn.Parameter(torch.tensor(4.0))   # logit dynamic range
             self.aeh_bias  = nn.Parameter(torch.tensor(0.0))
@@ -450,6 +465,8 @@ class EAHN(nn.Module):
             self.aeh_suff_topk_frac = float(getattr(config, "aeh_suff_topk_frac", 0.0))
         else:
             self.aeh_score = None
+            self.aeh_freq_enabled   = False
+            self.aeh_freq_dim       = 0
             self.aeh_topk_frac      = 0.0
             self.aeh_suff_topk_frac = 0.0
 
@@ -573,6 +590,45 @@ class EAHN(nn.Module):
 
         M_mix = M_mix_flat.reshape(B, T, self.feat_h, self.feat_w)
         return M_mix, M_layers, layer_w, overlap, float(g.item())
+
+    # ── Phase 43: SRM spectral branch for the additive head ───────────────────
+    @staticmethod
+    def _srm_kernels() -> torch.Tensor:
+        """3 fixed SRM high-pass filters (5x5), each averaged across the 3 RGB
+        input channels -> weight (3 out, 3 in, 5, 5).  Standard steganalysis /
+        forgery residual extractors (Fridrich-Kodovsky); they suppress image
+        content and expose generation/blending high-frequency traces."""
+        f1 = torch.tensor([[0, 0, 0, 0, 0],
+                           [0, -1, 2, -1, 0],
+                           [0, 2, -4, 2, 0],
+                           [0, -1, 2, -1, 0],
+                           [0, 0, 0, 0, 0]], dtype=torch.float32) / 4.0
+        f2 = torch.tensor([[-1, 2, -2, 2, -1],
+                           [2, -6, 8, -6, 2],
+                           [-2, 8, -12, 8, -2],
+                           [2, -6, 8, -6, 2],
+                           [-1, 2, -2, 2, -1]], dtype=torch.float32) / 12.0
+        f3 = torch.tensor([[0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0],
+                           [0, 1, -2, 1, 0],
+                           [0, 0, 0, 0, 0],
+                           [0, 0, 0, 0, 0]], dtype=torch.float32) / 2.0
+        w = torch.zeros(3, 3, 5, 5)
+        for o, f in enumerate((f1, f2, f3)):
+            for ic in range(3):
+                w[o, ic] = f / 3.0
+        return w
+
+    def _aeh_freq_features(self, frames: torch.Tensor, B: int, T: int, N: int) -> torch.Tensor:
+        """Phase 43: fixed SRM high-pass residual -> small CNN -> 7x7 spectral
+        features, returned as (B, T, N, aeh_freq_dim) aligned to the M_t cells."""
+        x = frames.reshape(B * T, frames.shape[2], frames.shape[3], frames.shape[4])
+        r = F.conv2d(x, self.aeh_srm_w, padding=2)                  # (B*T,3,H,W) residual
+        r = self.aeh_freq_cnn(r)                                    # (B*T,dfreq,h',w')
+        r = F.adaptive_avg_pool2d(r, (self.feat_h, self.feat_w))    # (B*T,dfreq,7,7)
+        r = r.reshape(B, T, self.aeh_freq_dim, self.feat_h, self.feat_w)
+        r = r.permute(0, 1, 3, 4, 2).reshape(B, T, N, self.aeh_freq_dim)
+        return r
 
     def forward(self, frames: torch.Tensor,
                 lambda_grl: float = 0.0,
@@ -717,6 +773,12 @@ class EAHN(nn.Module):
         # is the FAITHFUL saliency the eval ranks by.
         if self.aeh_enabled:
             local_feat  = feats_5d.permute(0, 1, 3, 4, 2).reshape(B, T, N, d)  # (B,T,N,d)
+            if self.aeh_freq_enabled:
+                # Phase 43: concat SRM spectral features (generic+local forgery cue)
+                # so the per-cell evidence e responds to frequency anomalies, not
+                # just the holistic RGB fingerprint -> cross-dataset + localization.
+                freq_feat  = self._aeh_freq_features(frames, B, T, N)          # (B,T,N,dfreq)
+                local_feat = torch.cat([local_feat, freq_feat.to(local_feat.dtype)], dim=-1)
             _e          = self.aeh_score(local_feat).squeeze(-1)               # (B,T,N)
             aeh_contrib = M_flat * _e                                          # (B,T,N) signed cell evidence
             # Full (all-cell) faithful logit -- the Phase 39 prediction.

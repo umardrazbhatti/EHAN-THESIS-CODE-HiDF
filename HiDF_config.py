@@ -308,6 +308,16 @@ class EAHNConfig:
     lambda_aeh_temporal_conc: float = 0.0 # weight: concentrate M_frame over frames
                                         # (entropy, fake-only) -> a few frames carry the
                                         # evidence -> sharper top-K frame-drop (k-drops).
+    # ── Phase 43: frequency-aware local evidence (cross-dataset + localization) ─
+    # The detector keys on a HOLISTIC, HiDF-specific RGB fingerprint -> off-dataset
+    # fakes (Deepfakes fake_acc 0.23, Celeb-DF 0.06) and diffuse heatmaps.  A fixed
+    # SRM high-pass branch + small CNN produces 7x7 SPECTRAL features that are
+    # concatenated into the additive head's per-cell evidence e[t,n].  Spectral
+    # forgery traces are GENERIC across manipulation types (cross-dataset) AND
+    # spatially localized (explanation), and present in HiDF's regenerated faces
+    # (in-dist preserved).  OFF (default) = aeh_score reads d -> byte-identical P39.
+    aeh_freq_enabled:   bool  = False   # Phase 43: SRM spectral branch into e
+    aeh_freq_dim:       int   = 32      # freq feature channels concatenated to local_feat
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -796,6 +806,15 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 41: weight to concentrate M_frame over frames "
                              "(entropy, fake samples only) -> a few frames carry the "
                              "evidence, sharpening the top-K frame-drop test. 0.0 = off.")
+    parser.add_argument("--aeh_freq_enabled", dest="aeh_freq_enabled",
+                        action="store_true", default=None,
+                        help="Phase 43: add a fixed SRM high-pass spectral branch whose "
+                             "7x7 features are concatenated into the additive head's per-cell "
+                             "evidence e -> generic+local forgery cue (cross-dataset + "
+                             "localization). Requires --aeh_enabled. OFF = byte-identical P39.")
+    parser.add_argument("--aeh_freq_dim", type=int, default=None,
+                        help="Phase 43: # spectral feature channels concatenated to local_feat "
+                             "(default 32).")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "
