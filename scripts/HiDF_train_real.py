@@ -365,6 +365,15 @@ def main(config: EAHNConfig):
             f"(SOFT concentration as PURE AUX losses; prediction NOT bottlenecked; "
             f"replaces P40 EXP-1 hard top-k which backfired -> more diffuse)"
         )
+        _attn_freq = bool(getattr(config, "aeh_attn_freq", False))
+        _freq_mode = str(getattr(config, "aeh_freq_mode", "srm"))
+        _n_taps    = 6 if _freq_mode == "multiband" else 3
+        print(
+            f"[Phase44] aeh_attn_freq={_attn_freq}  aeh_freq_mode={_freq_mode} ({_n_taps} taps)  "
+            f"lambda_calib={getattr(config, 'lambda_calib', 0.0)}  "
+            f"(attn_freq=route spectral score into displayed M_t; multiband=richer "
+            f"high-pass bank; calib=anchor the 0.5 operating point)"
+        )
 
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
@@ -976,6 +985,21 @@ def main(config: EAHNConfig):
                     l_total = l_total + _lambda_cons * l_consistency
                 else:
                     l_consistency = torch.tensor(0.0)
+
+                # ── Phase 44: operating-point calibration regularizer ─────────
+                # Pins the batch mean predicted prob to the batch fake-rate so the
+                # 0.5 decision threshold stops drifting epoch-to-epoch (the val
+                # fake/real-acc oscillation; optimal_threshold swung 0.31-0.71).
+                # It anchors the score OFFSET only; ranking (AUC) is untouched.
+                # 0.0 = off (byte-identical).
+                _lambda_calib = float(getattr(config, "lambda_calib", 0.0))
+                if _lambda_calib > 0.0:
+                    _p_mean = torch.sigmoid(logits_A).mean()
+                    _y_mean = labels.float().mean()
+                    l_calib = (_p_mean - _y_mean) ** 2
+                    l_total = l_total + _lambda_calib * l_calib
+                else:
+                    l_calib = torch.tensor(0.0)
 
                 # ── NaN guard — skip step if any loss term is non-finite ──────
                 if not torch.isfinite(l_total):

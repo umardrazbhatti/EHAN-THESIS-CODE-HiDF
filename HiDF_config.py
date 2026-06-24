@@ -318,6 +318,14 @@ class EAHNConfig:
     # (in-dist preserved).  OFF (default) = aeh_score reads d -> byte-identical P39.
     aeh_freq_enabled:   bool  = False   # Phase 43: SRM spectral branch into e
     aeh_freq_dim:       int   = 32      # freq feature channels concatenated to local_feat
+    # Phase 44: route the spectral features into the DISPLAYED attention M_t (not
+    # just the additive evidence e), use a richer multi-band high-pass front-end,
+    # and add an operating-point calibration regularizer.  All OFF/default = exact
+    # Phase 43 (byte-identical when aeh_attn_freq=False, aeh_freq_mode="srm",
+    # lambda_calib=0.0).
+    aeh_attn_freq:      bool  = False   # Phase 44: bias M_t logits with per-cell spectral score
+    aeh_freq_mode:      str   = "srm"   # Phase 44: "srm" (3 taps, byte-id) | "multiband" (6-tap bank)
+    lambda_calib:       float = 0.0     # Phase 44: weight for the mean-prob calibration regularizer
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -815,6 +823,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aeh_freq_dim", type=int, default=None,
                         help="Phase 43: # spectral feature channels concatenated to local_feat "
                              "(default 32).")
+    parser.add_argument("--aeh_attn_freq", dest="aeh_attn_freq",
+                        action="store_true", default=None,
+                        help="Phase 44: route the spectral features into the DISPLAYED attention "
+                             "M_t (add a per-cell spectral score to the attention logits, "
+                             "alpha init 0 = cold-start identical). Makes the map point at the "
+                             "artifact -> insertion/sufficiency + sample-specific heatmaps + "
+                             "cross-dataset. Requires --aeh_freq_enabled. OFF = byte-identical P43.")
+    parser.add_argument("--aeh_freq_mode", type=str, default=None,
+                        choices=["srm", "multiband"],
+                        help="Phase 44: spectral front-end. 'srm' = 3 fixed SRM taps (byte-identical "
+                             "P43); 'multiband' = richer 6-tap multi-order/orientation high-pass bank "
+                             "(SRM + Laplacian + Sobel-x/-y) for a stronger frequency representation.")
+    parser.add_argument("--lambda_calib", type=float, default=None,
+                        help="Phase 44: weight for the operating-point calibration regularizer "
+                             "(pins batch mean predicted prob to the batch fake-rate so the 0.5 "
+                             "threshold stops drifting epoch-to-epoch). 0.0 = off (byte-identical).")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

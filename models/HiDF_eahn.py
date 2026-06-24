@@ -438,15 +438,40 @@ class EAHN(nn.Module):
             # OFF -> aeh_score reads d (byte-identical Phase 39 state_dict).
             self.aeh_freq_enabled = bool(getattr(config, "aeh_freq_enabled", False))
             if self.aeh_freq_enabled:
-                self.aeh_freq_dim = int(getattr(config, "aeh_freq_dim", 32))
-                self.register_buffer("aeh_srm_w", self._srm_kernels())   # (3,3,5,5) fixed
+                self.aeh_freq_dim  = int(getattr(config, "aeh_freq_dim", 32))
+                # Phase 44: "srm" (3 taps, byte-identical P43) or "multiband" (richer
+                # 6-tap high-pass bank). The buffer's out-channel count K sets the
+                # freq-CNN input width, so the front-end swaps with no other change.
+                self.aeh_freq_mode = str(getattr(config, "aeh_freq_mode", "srm"))
+                _srm_w = self._srm_kernels(self.aeh_freq_mode)           # (K,3,5,5) fixed
+                self.register_buffer("aeh_srm_w", _srm_w)
+                _srm_out = _srm_w.shape[0]                               # K residual channels
                 self.aeh_freq_cnn = nn.Sequential(
-                    nn.Conv2d(3, 16, 5, stride=4, padding=2), nn.GELU(),               # /4
+                    nn.Conv2d(_srm_out, 16, 5, stride=4, padding=2), nn.GELU(),           # /4
                     nn.Conv2d(16, self.aeh_freq_dim, 3, stride=2, padding=1), nn.GELU(),  # /2
                 )
+                # Phase 44: optionally route the spectral features into the DISPLAYED
+                # attention M_t (not just the additive evidence e), so the map itself
+                # points at the artifact -> sufficiency (insertion) + sample-specific
+                # heatmaps + cross-dataset.  alpha init 0 = cold-start identical to the
+                # RGB-only attention (detection-safe); it learns how much freq to add.
+                self.aeh_attn_freq = bool(getattr(config, "aeh_attn_freq", False))
+                if self.aeh_attn_freq:
+                    # Zero-init residual projection: the freq bias on the attention
+                    # logits starts at EXACTLY 0 (cold-start identical to RGB-only
+                    # attention -> detection-safe) BUT the proj still receives
+                    # gradient from step 1 (its grad depends on the freq inputs,
+                    # not on its own zeroed output -- the standard zero-init-residual
+                    # trick).  No alpha multiplier, which would have starved the proj
+                    # of gradient while it sat at 0.
+                    self.aeh_attn_freq_proj = nn.Conv2d(self.aeh_freq_dim, 1, kernel_size=1)
+                    nn.init.zeros_(self.aeh_attn_freq_proj.weight)
+                    nn.init.zeros_(self.aeh_attn_freq_proj.bias)
                 _aeh_in = d + self.aeh_freq_dim
             else:
-                self.aeh_freq_dim = 0
+                self.aeh_freq_dim  = 0
+                self.aeh_freq_mode = "srm"
+                self.aeh_attn_freq = False
                 _aeh_in = d
             self.aeh_score = nn.Sequential(
                 nn.LayerNorm(_aeh_in),
@@ -467,6 +492,8 @@ class EAHN(nn.Module):
             self.aeh_score = None
             self.aeh_freq_enabled   = False
             self.aeh_freq_dim       = 0
+            self.aeh_freq_mode      = "srm"   # Phase 44
+            self.aeh_attn_freq      = False   # Phase 44
             self.aeh_topk_frac      = 0.0
             self.aeh_suff_topk_frac = 0.0
 
@@ -593,11 +620,17 @@ class EAHN(nn.Module):
 
     # ── Phase 43: SRM spectral branch for the additive head ───────────────────
     @staticmethod
-    def _srm_kernels() -> torch.Tensor:
-        """3 fixed SRM high-pass filters (5x5), each averaged across the 3 RGB
-        input channels -> weight (3 out, 3 in, 5, 5).  Standard steganalysis /
-        forgery residual extractors (Fridrich-Kodovsky); they suppress image
-        content and expose generation/blending high-frequency traces."""
+    def _srm_kernels(mode: str = "srm") -> torch.Tensor:
+        """Fixed high-pass forgery-residual filters (5x5), each averaged across the
+        3 RGB input channels -> weight (K out, 3 in, 5, 5).  They suppress image
+        content and expose generation/blending high-frequency traces.
+
+        mode="srm"       -> 3 canonical SRM taps (Fridrich-Kodovsky); K=3.
+                            BYTE-IDENTICAL to Phase 43.
+        mode="multiband" -> the 3 SRM taps + Laplacian + Sobel-x + Sobel-y (K=6):
+                            a richer multi-order / multi-orientation high-pass bank
+                            (Phase 44 EXP-C2) for a stronger frequency front-end.
+        Every tap sums to ~0 (content-suppressing)."""
         f1 = torch.tensor([[0, 0, 0, 0, 0],
                            [0, -1, 2, -1, 0],
                            [0, 2, -4, 2, 0],
@@ -613,22 +646,47 @@ class EAHN(nn.Module):
                            [0, 1, -2, 1, 0],
                            [0, 0, 0, 0, 0],
                            [0, 0, 0, 0, 0]], dtype=torch.float32) / 2.0
-        w = torch.zeros(3, 3, 5, 5)
-        for o, f in enumerate((f1, f2, f3)):
+        filters = [f1, f2, f3]
+        if str(mode) == "multiband":
+            lap = torch.tensor([[0, 0, 0, 0, 0],
+                                [0, 0, -1, 0, 0],
+                                [0, -1, 4, -1, 0],
+                                [0, 0, -1, 0, 0],
+                                [0, 0, 0, 0, 0]], dtype=torch.float32) / 4.0
+            sx = torch.tensor([[0, 0, 0, 0, 0],
+                               [0, -1, 0, 1, 0],
+                               [0, -2, 0, 2, 0],
+                               [0, -1, 0, 1, 0],
+                               [0, 0, 0, 0, 0]], dtype=torch.float32) / 4.0
+            sy = torch.tensor([[0, 0, 0, 0, 0],
+                               [0, -1, -2, -1, 0],
+                               [0, 0, 0, 0, 0],
+                               [0, 1, 2, 1, 0],
+                               [0, 0, 0, 0, 0]], dtype=torch.float32) / 4.0
+            filters = filters + [lap, sx, sy]
+        K = len(filters)
+        w = torch.zeros(K, 3, 5, 5)
+        for o, f in enumerate(filters):
             for ic in range(3):
                 w[o, ic] = f / 3.0
         return w
 
-    def _aeh_freq_features(self, frames: torch.Tensor, B: int, T: int, N: int) -> torch.Tensor:
-        """Phase 43: fixed SRM high-pass residual -> small CNN -> 7x7 spectral
-        features, returned as (B, T, N, aeh_freq_dim) aligned to the M_t cells."""
+    def _aeh_freq_map(self, frames: torch.Tensor, B: int, T: int) -> torch.Tensor:
+        """Phase 44: fixed high-pass residual -> small CNN -> 7x7 spectral feature
+        MAP, returned as (B, T, aeh_freq_dim, feat_h, feat_w).  Shared by the
+        additive-evidence path (_aeh_freq_features) and the optional attention-
+        routing path (Phase 44).  For mode='srm' this is exactly the Phase 43
+        computation."""
         x = frames.reshape(B * T, frames.shape[2], frames.shape[3], frames.shape[4])
-        r = F.conv2d(x, self.aeh_srm_w, padding=2)                  # (B*T,3,H,W) residual
+        r = F.conv2d(x, self.aeh_srm_w, padding=2)                  # (B*T,K,H,W) residual
         r = self.aeh_freq_cnn(r)                                    # (B*T,dfreq,h',w')
         r = F.adaptive_avg_pool2d(r, (self.feat_h, self.feat_w))    # (B*T,dfreq,7,7)
-        r = r.reshape(B, T, self.aeh_freq_dim, self.feat_h, self.feat_w)
-        r = r.permute(0, 1, 3, 4, 2).reshape(B, T, N, self.aeh_freq_dim)
-        return r
+        return r.reshape(B, T, self.aeh_freq_dim, self.feat_h, self.feat_w)
+
+    def _aeh_freq_features(self, frames: torch.Tensor, B: int, T: int, N: int) -> torch.Tensor:
+        """Phase 43: spectral features aligned to the M_t cells (B, T, N, aeh_freq_dim)."""
+        r = self._aeh_freq_map(frames, B, T)                        # (B,T,dfreq,h,w)
+        return r.permute(0, 1, 3, 4, 2).reshape(B, T, N, self.aeh_freq_dim)
 
     def forward(self, frames: torch.Tensor,
                 lambda_grl: float = 0.0,
@@ -661,6 +719,22 @@ class EAHN(nn.Module):
         )
         # v4: unpack (softmax map, raw logits, tau scalar)
         M_t_early, M_t_logits, _tau_val = self.early_attn(feats_5d)
+        # ── Phase 44: artifact-routed attention (freq -> M_t) ─────────────────
+        # Bias the DISPLAYED/USED attention logits with a per-cell spectral score
+        # so the map points at the forgery artifact, not just the holistic RGB
+        # fingerprint.  This flows through the gate/refine/pool/M_t_up and the
+        # additive contribution (M_flat*e) with no other wiring, so insertion
+        # sufficiency, sample-specific heatmaps and cross-dataset all key on it.
+        # alpha init 0 -> cold-start byte-identical to the RGB-only attention.
+        if self.aeh_enabled and self.aeh_freq_enabled and self.aeh_attn_freq:
+            _fmap   = self._aeh_freq_map(frames, B, T)               # (B,T,dfreq,h,w)
+            _fmapBT = _fmap.reshape(B * T, self.aeh_freq_dim, self.feat_h, self.feat_w)
+            _falog  = self.aeh_attn_freq_proj(_fmapBT).reshape(B, T, self.feat_h, self.feat_w)
+            M_t_logits = M_t_logits + _falog
+            _Nf = self.feat_h * self.feat_w
+            M_t_early = F.softmax(
+                M_t_logits.reshape(B, T, _Nf) / max(_tau_val, 1e-6), dim=-1
+            ).reshape(B, T, self.feat_h, self.feat_w)
         # ── Phase 38: PRE-transformer hard spatial bottleneck ─────────────────
         # When early_topk_frac in (0,1): replace the soft floored gate with a HARD
         # top-k binary gate over the N conv cells (forward = 0/1 mask, backward =
