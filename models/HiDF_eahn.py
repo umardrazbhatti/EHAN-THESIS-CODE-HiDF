@@ -145,6 +145,10 @@ class EAHNOutput:
     #                  None when no top-k fraction is active.
     aeh_contrib:     torch.Tensor = None
     aeh_topk_logit:  torch.Tensor = None
+    # Phase 45: the PRE-aeh-blend logit (the global base head).  Exposed so the
+    # contribution-space del/ins can reconstruct the blended decision
+    # logit = (1-g)*base_logit + g*aeh_logit while removing only aeh cell terms.
+    base_logit:      torch.Tensor = None
 
 
 class EarlyAttnHead(nn.Module):
@@ -975,6 +979,7 @@ class EAHN(nn.Module):
         # (set on aeh_gamma_current by the train loop); at g=1 the faithful head
         # IS the predictor, so the explanation metrics score the real decision.
         # Detection is protected early by the proven base head while g is small.
+        base_logit_pre = logit                       # Phase 45: pre-aeh-blend base head
         if self.aeh_enabled:
             _g_aeh = (float(aeh_gamma) if aeh_gamma is not None
                       else float(self.aeh_gamma_current))
@@ -1031,4 +1036,5 @@ class EAHN(nn.Module):
             aeh_sal_up=aeh_sal_up,
             aeh_contrib=aeh_contrib,
             aeh_topk_logit=aeh_topk_logit,
+            base_logit=base_logit_pre,
         )

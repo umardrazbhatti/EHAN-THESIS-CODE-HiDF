@@ -320,6 +320,117 @@ class ExplanationMetrics:
         return result
 
     @staticmethod
+    def contribution_del_ins(aeh_contrib, M_frame, scale, bias, base_logit, gamma,
+                             labels=None, seed: int = 123, verbose: bool = True) -> dict:
+        """Phase 45: ANALYTIC contribution-space deletion / insertion for the
+        additive head.  The head's logit is an EXACT sum over cells:
+
+            aeh_logit = scale * Σ_n wcell[n] + bias,
+            wcell[n]  = Σ_t M_frame[t] · (M_t·e)[t,n]      (effective per-cell)
+
+        so removing a cell removes EXACTLY its term -- no forward pass, no pixel
+        occlusion, no transformer re-globalisation, no 20%-base floor.  This is
+        the metric the P39 head was built for and that P39-44 never had: the
+        pixel-occlusion del/ins re-ran the full blended net, which the global head
+        routes around (holistic redundancy), so the head's by-construction
+        faithfulness was invisible.
+
+        Deletion removes the highest-contribution cells first (MoRF): a faithful +
+        concentrated head DROPS steeply -> LOW deletion AUC.  Insertion adds them
+        first onto the bias-only canvas: a SUFFICIENT head RISES steeply -> HIGH
+        insertion AUC.  A random-cell ordering is the floor.  Computed on ALL
+        samples (it is arithmetic), so the fake-only aggregates are free of the
+        ~24-clip noise that made the pixel-occlusion del/ins swing 0.38<->0.75.
+
+        Reported on BOTH the pure additive logit (the head's intrinsic
+        faithfulness) and the blended decision logit (1-g)*base + g*aeh (what the
+        model predicts).  Lower deletion, higher insertion, positive gains over
+        random = the head is faithful and localised.
+
+        aeh_contrib : (N,T,Ncells) signed per-cell contribution M_t*e
+        M_frame     : (N,T) temporal weights
+        scale,bias  : floats (model.aeh_scale, model.aeh_bias)
+        base_logit  : (N,) pre-aeh-blend base-head logit
+        gamma       : float eval blend
+        labels      : optional (N,) 0/1 for fake-only aggregates
+        """
+        import numpy as _np
+        C    = _np.asarray(aeh_contrib, dtype=_np.float64)           # (N,T,Ncells)
+        Mf   = _np.asarray(M_frame, dtype=_np.float64)               # (N,T)
+        base = _np.asarray(base_logit, dtype=_np.float64).reshape(-1)  # (N,)
+        g, s, b = float(gamma), float(scale), float(bias)
+        N, T, Nc = C.shape
+        wcell = (Mf[:, :, None] * C).sum(axis=1)                     # (N,Ncells) effective
+        total = wcell.sum(axis=1)                                    # (N,)
+        if labels is not None:
+            labels = _np.asarray(labels).reshape(-1)
+        try:
+            _trapz = _np.trapezoid
+        except AttributeError:
+            _trapz = _np.trapz
+
+        def _sig(x):
+            return 1.0 / (1.0 + _np.exp(-_np.clip(x, -30.0, 30.0)))
+
+        def _curves(order):
+            sorted_w = _np.take_along_axis(wcell, order, axis=1)     # (N,Ncells)
+            csum     = _np.cumsum(sorted_w, axis=1)                  # (N,Ncells)
+            ins_part = _np.concatenate([_np.zeros((N, 1)), csum], axis=1)  # (N,Ncells+1)
+            del_part = total[:, None] - ins_part                    # (N,Ncells+1)
+            aeh_ins  = s * ins_part + b
+            aeh_del  = s * del_part + b
+            ins_p = _sig(aeh_ins);                       del_p = _sig(aeh_del)
+            bl_ins = _sig((1 - g) * base[:, None] + g * aeh_ins)
+            bl_del = _sig((1 - g) * base[:, None] + g * aeh_del)
+            return ins_p, del_p, bl_ins, bl_del
+
+        order_int = _np.argsort(wcell, axis=1)[:, ::-1].copy()        # descending (most fake +)
+        _rng      = _np.random.default_rng(seed)
+        order_rnd = _np.stack([_rng.permutation(Nc) for _ in range(N)])
+
+        ins_p,  del_p,  bl_ins,  bl_del  = _curves(order_int)
+        ins_pr, del_pr, bl_insr, bl_delr = _curves(order_rnd)
+
+        def _auc(curve):                                             # (N,Ncells+1)->(N,)
+            return _trapz(curve, axis=1) / Nc
+
+        out = {"n_samples": int(N), "gamma": g,
+               "n_fake": int((labels == 1).sum()) if labels is not None else -1}
+
+        def _pack(prefix, ins, dele, ins_r, del_r):
+            ia, da   = _auc(ins),   _auc(dele)
+            iar, dar = _auc(ins_r), _auc(del_r)
+            out[f"{prefix}_deletion_auc"]         = float(da.mean())
+            out[f"{prefix}_insertion_auc"]        = float(ia.mean())
+            out[f"{prefix}_ins_gain_over_random"] = float((ia - iar).mean())
+            out[f"{prefix}_del_gain_over_random"] = float((dar - da).mean())
+            if labels is not None and (labels == 1).any():
+                fk = labels == 1
+                out[f"{prefix}_deletion_auc_fake_only"]  = float(da[fk].mean())
+                out[f"{prefix}_insertion_auc_fake_only"] = float(ia[fk].mean())
+                out[f"{prefix}_ins_gain_fake_only"]      = float((ia[fk] - iar[fk]).mean())
+                out[f"{prefix}_del_gain_fake_only"]      = float((dar[fk] - da[fk]).mean())
+
+        _pack("aeh",     ins_p,  del_p,  ins_pr, del_pr)
+        _pack("blended", bl_ins, bl_del, bl_insr, bl_delr)
+
+        if verbose:
+            print(f"\n  [Contribution-space del/ins] N={N} (fake={out['n_fake']}), "
+                  f"cells={Nc}, gamma={g:.2f}  (ANALYTIC -- all samples, exact)")
+            print(f"  {'space':>8}  {'del_auc':>8}  {'ins_auc':>8}  "
+                  f"{'del_gain':>9}  {'ins_gain':>9}   (fake-only)")
+            for pre in ("aeh", "blended"):
+                dk = out.get(f"{pre}_deletion_auc_fake_only",  out[f"{pre}_deletion_auc"])
+                ik = out.get(f"{pre}_insertion_auc_fake_only", out[f"{pre}_insertion_auc"])
+                dg = out.get(f"{pre}_del_gain_fake_only", out[f"{pre}_del_gain_over_random"])
+                ig = out.get(f"{pre}_ins_gain_fake_only", out[f"{pre}_ins_gain_over_random"])
+                print(f"  {pre:>8}  {dk:>8.4f}  {ik:>8.4f}  {dg:>+9.4f}  {ig:>+9.4f}")
+            print("  (lower del + higher ins + positive gains = faithful & localised; "
+                  "reads the head's ACTUAL per-cell terms, immune to re-globalisation "
+                  "and the 20%-base floor)")
+        return out
+
+    @staticmethod
     def layer_ablation_causal(model, frames, labels=None, n_samples: int = 50,
                               chunk: int = 4, verbose: bool = True) -> dict:
         """Phase 36 causal self-consistency check for the intrinsic decomposition.

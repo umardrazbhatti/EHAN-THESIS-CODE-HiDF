@@ -326,6 +326,16 @@ class EAHNConfig:
     aeh_attn_freq:      bool  = False   # Phase 44: bias M_t logits with per-cell spectral score
     aeh_freq_mode:      str   = "srm"   # Phase 44: "srm" (3 taps, byte-id) | "multiband" (6-tap bank)
     lambda_calib:       float = 0.0     # Phase 44: weight for the mean-prob calibration regularizer
+    # Phase 45: SIGNED-SUM top-k concentration.  P40/P41 concentrated ReLU(M_t*e)
+    # (the positive-part DISPLAY) while the prediction is the SIGNED sum -> the map
+    # looked peaky but del/ins (which read the prediction) did not move.  This loss
+    # concentrates the quantity that ACTUALLY enters the logit: per fake clip it
+    # maximises s_topk/s_all where s = scale*Σ_t M_frame*Σ_n (M_t*e) -> the top-k
+    # cells capture the whole effective sum (tail -> 0).  Cannot be gamed by
+    # equalising cells (uniform -> ratio = k/N, the MINIMUM).  Measured directly by
+    # the new contribution-space del/ins.  0.0 = byte-identical Phase 44.
+    lambda_aeh_sigconc:    float = 0.0  # weight on the signed-sum top-k capture loss
+    aeh_sigconc_topk_frac: float = 0.15 # top-k fraction for it (0.15 = top ~7 of 49)
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -839,6 +849,16 @@ def parse_args() -> argparse.Namespace:
                         help="Phase 44: weight for the operating-point calibration regularizer "
                              "(pins batch mean predicted prob to the batch fake-rate so the 0.5 "
                              "threshold stops drifting epoch-to-epoch). 0.0 = off (byte-identical).")
+    parser.add_argument("--lambda_aeh_sigconc", type=float, default=None,
+                        help="Phase 45: weight on the SIGNED-SUM top-k concentration loss. Per "
+                             "fake clip, maximises s_topk/s_all of the EFFECTIVE per-cell "
+                             "contribution scale*M_frame*(M_t*e) so the top-k cells capture the "
+                             "whole logit (tail -> 0) -> faithful contribution-space del/ins. "
+                             "Unlike P40/P41 it acts on the SIGNED prediction, not ReLU display, "
+                             "so it cannot be gamed by equalising cells. 0.0 = off (byte-identical).")
+    parser.add_argument("--aeh_sigconc_topk_frac", type=float, default=None,
+                        help="Phase 45: top-k fraction for --lambda_aeh_sigconc "
+                             "(0.15 = top ~7 of 49 cells).")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

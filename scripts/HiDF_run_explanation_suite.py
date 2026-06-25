@@ -370,6 +370,53 @@ def run_explanation_suite(
     except Exception as e:
         print(f"  [layer_ablation_cumulative skipped: {e}]")
 
+    # ── 9d. Contribution-space del/ins (Phase 45, analytic, ALL samples) ──────
+    # The additive head's logit is an exact sum over cells, so deletion/insertion
+    # of a cell == removing/adding its term -- no forward, no pixel occlusion, no
+    # re-globalisation, no 20%-base floor.  This is the metric the head was built
+    # for; the pixel-occlusion del/ins above re-ran the full blended net and so
+    # could never see the head's by-construction faithfulness.  Free => runs on
+    # ALL samples (escapes the ~24-clip fake-only noise).
+    contribution_di = {}
+    try:
+        if getattr(model, "aeh_enabled", False):
+            print("[ExplanationSuite] Computing contribution-space del/ins "
+                  "(analytic additive-head terms, ALL samples)...")
+            _C, _MF, _BASE, _LAB = [], [], [], []
+            with torch.no_grad():
+                for batch in test_loader:
+                    _fr = batch["frames"].to(device, non_blocking=True)
+                    _o  = model(_fr)
+                    if getattr(_o, "aeh_contrib", None) is None:
+                        del _fr, _o
+                        break
+                    _C.append(_o.aeh_contrib.detach().cpu())              # (b,T,Ncells)
+                    _MF.append(_o.M_frame.detach().cpu())                 # (b,T)
+                    _BASE.append(_o.base_logit.detach().cpu().reshape(-1))  # (b,)
+                    _LAB.extend(batch.get("label",
+                                torch.zeros(_fr.shape[0])).cpu().tolist())
+                    del _fr, _o
+            if _C:
+                import torch as _t
+                def _scalar(x, d):
+                    if x is None:
+                        return d
+                    if _t.is_tensor(x):
+                        return float(x.detach().cpu().reshape(-1)[0].item())
+                    return float(x)
+                _scale = _scalar(getattr(model, "aeh_scale", None), 1.0)
+                _bias  = _scalar(getattr(model, "aeh_bias",  None), 0.0)
+                _gam   = _scalar(getattr(model, "aeh_gamma_current", None), 0.0)
+                contribution_di = ExplanationMetrics.contribution_del_ins(
+                    _t.cat(_C, 0).numpy(), _t.cat(_MF, 0).numpy(),
+                    _scale, _bias, _t.cat(_BASE, 0).numpy(), _gam,
+                    labels=_LAB, verbose=True,
+                )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"  [contribution_del_ins skipped: {e}]")
+
     # ── Assemble result ───────────────────────────────────────────────────────
     # Phase 28: fake-only del/ins aggregates from the per-sample records
     # (artifact localisation is only well-defined on manipulated samples).
@@ -403,6 +450,9 @@ def run_explanation_suite(
         # Phase 42: del/ins under every requested baseline (blur/black/mean).
         # The canonical intrinsic.{deletion,insertion}_auc above = headline (first).
         "del_ins_baselines":    del_ins_by_baseline,
+        # Phase 45: analytic contribution-space del/ins of the additive head
+        # (exact, all samples; the faithfulness readout the head was built for).
+        "contribution_space":   contribution_di,
     }
 
     # ── Print summary ─────────────────────────────────────────────────────────
@@ -424,6 +474,21 @@ def run_explanation_suite(
             print(f"    {_bl:<8} {_a['deletion_auc']:>7.3f} {_a['insertion_auc']:>7.3f} "
                   f"{_a['deletion_auc_fake_only']:>9.3f} {_a['insertion_auc_fake_only']:>9.3f} "
                   f"{_a['ins_gain_over_random']:>+9.4f} {_a['del_gain_over_random']:>+9.4f}")
+    if contribution_di:
+        print("  --- contribution-space del/ins (Phase 45; analytic, ALL fakes; "
+              "the head's OWN per-cell terms) ---")
+        for _pre in ("aeh", "blended"):
+            _dk = contribution_di.get(f"{_pre}_deletion_auc_fake_only",
+                                      contribution_di.get(f"{_pre}_deletion_auc", 0.0))
+            _ik = contribution_di.get(f"{_pre}_insertion_auc_fake_only",
+                                      contribution_di.get(f"{_pre}_insertion_auc", 0.0))
+            _ig = contribution_di.get(f"{_pre}_ins_gain_fake_only",
+                                      contribution_di.get(f"{_pre}_ins_gain_over_random", 0.0))
+            _dg = contribution_di.get(f"{_pre}_del_gain_fake_only",
+                                      contribution_di.get(f"{_pre}_del_gain_over_random", 0.0))
+            print(f"    {_pre:<8} del={_dk:>6.3f}  ins={_ik:>6.3f}  "
+                  f"ins_gain={_ig:>+7.4f}  del_gain={_dg:>+7.4f}  "
+                  f"(n_fake={contribution_di.get('n_fake', -1)}, gamma={contribution_di.get('gamma', 0.0):.2f})")
     print(f"  Inter-sample cosine      : {result['intrinsic']['inter_sample_cos_mean']:.3f}")
     print(f"  Peak mode share          : {result['intrinsic']['peak_mode_share']:.3f}")
     print(f"  M_t std mean             : {result['intrinsic']['m_t_std_mean']:.4f}")

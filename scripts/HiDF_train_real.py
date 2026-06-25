@@ -374,6 +374,14 @@ def main(config: EAHNConfig):
             f"(attn_freq=route spectral score into displayed M_t; multiband=richer "
             f"high-pass bank; calib=anchor the 0.5 operating point)"
         )
+        print(
+            f"[Phase45] lambda_aeh_sigconc={getattr(config, 'lambda_aeh_sigconc', 0.0)}  "
+            f"aeh_sigconc_topk_frac={getattr(config, 'aeh_sigconc_topk_frac', 0.15)}  "
+            f"(SIGNED-SUM top-k concentration: push s_topk/s_all->1 of the EFFECTIVE "
+            f"per-cell contribution on fakes -> top-k cells carry the whole logit; acts "
+            f"on the PREDICTION not the ReLU display, so not gameable by equalising; "
+            f"measured by the new contribution-space del/ins)"
+        )
 
     # v4: sharpness loss on M_t_logits (pre-softmax). Output is tanh-bounded
     # in [-1,0] so lambda_sharp=0.15 keeps it safely below cls magnitude.
@@ -612,6 +620,33 @@ def main(config: EAHNConfig):
                         _mfp  = _mf / _mf.sum(dim=1, keepdim=True)
                         _tent = -(_mfp * (_mfp + 1e-9).log()).sum(dim=1) # (B,)
                         loss_aeh_tconc = (_tent * _fakem).sum() / _fden
+
+                # ── Phase 45: SIGNED-SUM top-k concentration ──────────────────
+                # P40/P41 concentrated ReLU(M_t*e) (the positive-part DISPLAY),
+                # which the model satisfied while the SIGNED prediction stayed
+                # diffuse -> del/ins never moved (they read the prediction).  This
+                # acts on the quantity that actually enters the logit: the EFFECTIVE
+                # per-cell contribution wcell[n] = Σ_t M_frame[t]*(M_t*e)[t,n].  Per
+                # FAKE clip with positive net evidence, it pushes the top-k cells to
+                # capture the whole sum:  maximise s_topk/s_all -> 1  (tail -> 0), so
+                # the top-k cells are NECESSARY AND SUFFICIENT.  Cannot be gamed by
+                # equalising cells (uniform -> ratio = k/N, the MINIMUM).  This is
+                # exactly what the contribution-space del/ins reads out.  0.0 = off.
+                loss_aeh_sigconc = torch.zeros((), device=frames.device)
+                if (getattr(config, "aeh_enabled", False)
+                        and (out_A.aeh_contrib is not None)
+                        and float(getattr(config, "lambda_aeh_sigconc", 0.0)) > 0.0):
+                    _wcell = (out_A.M_frame.unsqueeze(-1) * out_A.aeh_contrib).sum(dim=1)  # (B,N) effective
+                    _Nc    = _wcell.shape[1]
+                    _ks    = max(1, int(round(
+                        float(getattr(config, "aeh_sigconc_topk_frac", 0.15)) * _Nc)))
+                    _s_all  = _wcell.sum(dim=1)                            # (B,) signed total
+                    _s_topk = _wcell.topk(_ks, dim=1).values.sum(dim=1)    # (B,) top-k (most positive)
+                    _ratio  = _s_topk / _s_all.clamp_min(1e-3)            # ->1 when tail vanishes
+                    _fakem  = (labels == 1).float()
+                    _valid  = _fakem * (_s_all > 1e-3).float()           # fakes with net-fake evidence
+                    loss_aeh_sigconc = (torch.relu(1.0 - _ratio) * _valid).sum() \
+                        / _valid.sum().clamp_min(1.0)
 
                 # Phase 30: B-pass and D-pass ALTERNATE by step parity so the
                 # per-step forward count stays at 2 (A + one bottleneck pass).
@@ -971,7 +1006,9 @@ def main(config: EAHNConfig):
                            + float(getattr(config, "lambda_aeh_topk_mass", 0.0))
                                                      * loss_aeh_mass      # Phase 41
                            + float(getattr(config, "lambda_aeh_temporal_conc", 0.0))
-                                                     * loss_aeh_tconc)    # Phase 41
+                                                     * loss_aeh_tconc     # Phase 41
+                           + float(getattr(config, "lambda_aeh_sigconc", 0.0))
+                                                     * loss_aeh_sigconc)  # Phase 45
 
                 # ── Consistency regularisation (unchanged) ────────────────────
                 _lambda_cons = float(getattr(config, "lambda_consistency", 0.0))
@@ -1320,14 +1357,29 @@ def main(config: EAHNConfig):
                             float(getattr(config, "aeh_mass_topk_frac", 0.15))
                             * _cn.shape[2])))
                         _tkshare = _cn.topk(_km, dim=2).values.sum(dim=2).mean().item()
+                        # Phase 45: signed-sum top-k CAPTURE ratio (what del/ins
+                        # reads).  s_topk/s_all over the EFFECTIVE contribution on
+                        # fake clips; ->1 = top-k cells carry the whole logit.
+                        _wc   = (out_A.M_frame.unsqueeze(-1) * out_A.aeh_contrib).sum(dim=1)  # (B,N)
+                        _km2  = max(1, int(round(
+                            float(getattr(config, "aeh_sigconc_topk_frac", 0.15))
+                            * _wc.shape[1])))
+                        _sa   = _wc.sum(dim=1)
+                        _stk  = _wc.topk(_km2, dim=1).values.sum(dim=1)
+                        _fkm  = (labels == 1).float() * (_sa > 1e-3).float()
+                        _capt = ((_stk / _sa.clamp_min(1e-3)) * _fkm).sum() \
+                            / _fkm.sum().clamp_min(1.0)
+                        _capt = float(_capt.item())
                     print(f"[DIAG-P39/40/41] aeh_gamma={float(out_A.aeh_gamma):.3f}  "
                           f"L_aeh_aux={loss_aeh_aux.item():.6f}  "
                           f"L_aeh_conc={loss_aeh_conc.item():.6f}  "
                           f"L_aeh_suff={loss_aeh_suff.item():.6f}  "
                           f"L_aeh_mass={loss_aeh_mass.item():.6f}  "
                           f"L_aeh_tconc={loss_aeh_tconc.item():.6f}  "
+                          f"L_aeh_sigconc={loss_aeh_sigconc.item():.6f}  "
                           f"top_cell_share={_share:.3f}  "
-                          f"top{_km}_share={_tkshare:.3f}")
+                          f"top{_km}_share={_tkshare:.3f}  "
+                          f"sig_capt={_capt:.3f}")
 
             # ── Batch balance check ───────────────────────────────────────────
             if (batch_idx + 1) % 1000 == 0:
