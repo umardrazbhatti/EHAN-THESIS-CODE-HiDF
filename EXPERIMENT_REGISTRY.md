@@ -128,27 +128,36 @@ limitation and the primary target of the next runs.
 - All metrics JSON incl. `contribution_space` block ✓
 - Corrected reporting (this run, post-hoc): `report_CORRECTED.txt`, `P45_PUBLISHABLE_SUMMARY.md`, `P45_results_table.csv` ✓
 
-### MISSING — must be added BEFORE the next run so its zip is paper-complete
-1. **Contribution-space insertion/deletion CURVE figure** — metric saves AUCs only, not the curve arrays → cannot plot del/ins without re-running. **Fix:** export curves in `contribution_del_ins` + plot in suite.
-2. **ROAD curve figure** — `road[name]["curve"]` exists in JSON but no auto PNG. **Fix:** add ROAD plot.
-3. **Faithfulness figure/table using the CORRECT metric** — `09_metrics_summary.csv` still carries the old pixel numbers. **Fix:** add a contribution-space headline CSV + a faithful-vs-random bar.
-4. **Cross-experiment comparison figure** (the 4-model table as a plotted panel) — currently only the local `P45_results_table.csv`. **Fix:** small script in the bundle.
-5. **Consolidated "paper numbers" CSV per model** (detection + contribution-space + cross in one file with the corrected headline).
-6. (Nice-to-have) qualitative heatmap grid: real/fake × correct/incorrect, multiple samples.
+### Shipped in P46 (every run from 6-26-26 2300hrs onward carries these)
+1. ✅ **Contribution-space del/ins CURVE figure** — `contribution_del_ins_curve.png` (curve arrays now exported in the JSON too).
+2. ✅ **ROAD curve figure** — `road_curve.png`.
+3. ✅ **Corrected faithfulness CSV + authoritative report** — `faithfulness_summary.csv` + `faithfulness_report.txt` (contribution-space headline).
+
+### Still nice-to-have (not blocking)
+4. **Cross-experiment comparison figure** (the multi-model table as a plotted panel) — currently the local `P45_results_table.csv`; can be generated post-hoc from any set of result folders (no re-run needed).
+5. (Nice-to-have) qualitative heatmap grid: real/fake × correct/incorrect, multiple samples (partially present in `heatmaps/`).
 
 ---
 
 ## Improvement roadmap (staged, one axis per run)
 
-1. **EXP2 → generalization run — ✅ BUILT (`Exp_A_p46_generalize_g80`, Phase 46):**
-   added `--generalize_aug` = a `RandomDownscale` (0.3–0.7×) inserted into every train
-   path **including all 4 DANN domains** (the active path — DANN is ON, so the standard
-   pipeline was dead; this catch was verified before build). Keeps `sigconc 0.15`,
-   calibration, freq, moderate SBI. Default-OFF byte-identical; smoke-green. Paper-asset
-   fixes landed in the same change (del/ins curve export + `contribution_del_ins_curve.png`
-   + `road_curve.png` + `faithfulness_summary.csv`). **Targets:** cross-dataset fake recall
-   up, in-dist AUC ≥0.95, contribution-space faithful stays YES. Run it next.
-2. **EXP3 → fix operating point** (threshold/checkpoint pick) + moderate generalization;
-   keep it as the sharp-explanation model.
+1. **EXP2 → generalization (`Exp_A_p46_generalize_g80`, Phase 46) — ✅ RAN 6-26-26 2300hrs.**
+   `--generalize_aug` fired (verified: `RandomDownscale` active in training). **Partial win:**
+   in-dist IMPROVED (AUC 0.972→**0.977**, fake@0.5 0.867→**0.901**, bal 0.911→**0.917**) and
+   explanation IMPROVED + faithful (blended ins 0.832→**0.878**, del 0.513→**0.424**, head ins
+   **0.902**/del **0.342**, faithful YES; m_t_std 0.0168→0.0255 = sharper). **BUT cross-dataset
+   AUC DROPPED across the board** (Deepfakes 0.820→0.743, NeuralTextures 0.670→0.613, Celeb-DF
+   0.563→0.534). Insight: the weakly-transferring cross signal is HIGH-FREQUENCY; downscale
+   destroyed it → degradation is the WRONG lever for cross-dataset. Paper figures all generated.
+   **P46 is the new best in-dist + explanation model** (candidate headline; promotion pending).
+2. **Phase 47 — two parallel runs (built 6-26-26):**
+   - **`Exp_A_p47_sbi_seams_g80`** = cross-dataset, DIFFERENT lever: EXP2 base (NO downscale) +
+     stronger generic blend-seams (`sbi_cls 1.0→1.5, stride 6→4, freq_mismatch 0.5→0.7`) with
+     calibration holding the operating point (the protection P43-sbi-primary lacked). Honest
+     long shot. **Watch:** cross AUC/fake recall up (esp. blend-based FaceShifter/FaceSwap);
+     in-dist holds; faithful YES.
+   - **`Exp_B_p47_exp3_sharp_g80`** = EXP3 lineage (staged): strong `sigconc 0.4` + `--generalize_aug`
+     (proven operating-point + explanation booster) = the definitive explanation-showcase model
+     (sharpest deletion + fixed operating point). Cross-dataset is NOT its job.
 3. **EXP1 → control**, re-scored honestly (threshold) — kept as the no-lever reference.
 4. **Final run → best-of**, all fixes folded in, complete paper-ready bundle → write-up.
