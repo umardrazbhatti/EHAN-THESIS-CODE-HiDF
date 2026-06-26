@@ -82,10 +82,61 @@ class RandomJPEGCompression:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 46: resolution-downscale generalization
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RandomDownscale:
+    """With probability ``p``, downscale the PIL image to a random factor in
+    ``[lo, hi]`` of its size and upscale it back (bilinear).  Simulates the
+    resolution / sharpness loss that separates HiDF (high-res native) from
+    Celeb-DF and FF++ (compressed, re-encoded, often lower effective resolution),
+    so the detector stops keying on the HiDF pixel-perfect fingerprint and learns
+    generic, transferable artifacts.  Class-symmetric (same p for real and fake)
+    and factors kept >= ~0.3 so the manipulation artifact is degraded, NOT erased
+    (per project history, asymmetric/erasing augmentation creates "blur = fake"
+    shortcuts that destroy the classifier).  This is the resolution axis the
+    Phase-27 DANN domains (clean / heavy-JPEG / noise / blur) never covered.
+    """
+    def __init__(self, p: float = 0.40, lo: float = 0.30, hi: float = 0.70):
+        self.p  = float(p)
+        self.lo = float(lo)
+        self.hi = float(hi)
+
+    def __call__(self, img):
+        if random.random() > self.p:
+            return img
+        if not isinstance(img, Image.Image):
+            return img
+        w, h = img.size
+        f    = random.uniform(self.lo, self.hi)
+        nw   = max(8, int(round(w * f)))
+        nh   = max(8, int(round(h * f)))
+        small = img.resize((nw, nh), Image.BILINEAR)
+        return small.resize((w, h), Image.BILINEAR)
+
+    def __repr__(self):
+        return f"RandomDownscale(p={self.p}, lo={self.lo}, hi={self.hi})"
+
+
+# Phase 46 generalization knobs (only active when aug_generalize=True; default OFF
+# everywhere keeps the augmentation pipelines byte-identical to the P45 baseline).
+_GEN_DOWNSCALE_P  = 0.40
+_GEN_DOWNSCALE_LO = 0.30
+_GEN_DOWNSCALE_HI = 0.70
+
+
+def _maybe_downscale(aug_generalize: bool):
+    """Return [RandomDownscale] when generalization is on, else [] (no-op)."""
+    if not aug_generalize:
+        return []
+    return [RandomDownscale(p=_GEN_DOWNSCALE_P, lo=_GEN_DOWNSCALE_LO, hi=_GEN_DOWNSCALE_HI)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public transform builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_train_pipeline(frame_size: int = 224):
+def _build_train_pipeline(frame_size: int = 224, aug_generalize: bool = False):
     """
     Cross-domain-robust train pipeline (6-8-26 v2 — moderated).
 
@@ -105,7 +156,7 @@ def _build_train_pipeline(frame_size: int = 224):
         lever — codec mismatch HiDF vs CelebDF c23 H.264 — kept full strength
         because JPEG compression is what bridges the actual domain gap)
     """
-    return transforms.Compose([
+    seq = [
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
@@ -114,6 +165,9 @@ def _build_train_pipeline(frame_size: int = 224):
             saturation=0.08,
             hue=0.03,
         ),
+    ]
+    seq += _maybe_downscale(aug_generalize)   # Phase 46 (OFF = no-op, byte-identical)
+    seq += [
         RandomJPEGCompression(p=0.30, q_lo=40, q_hi=80),
         transforms.RandomApply(
             [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))],
@@ -124,20 +178,21 @@ def _build_train_pipeline(frame_size: int = 224):
         transforms.RandomErasing(
             p=0.10, scale=(0.02, 0.05), ratio=(0.3, 3.3), value=0.0,
         ),
-    ])
+    ]
+    return transforms.Compose(seq)
 
 
-def get_heavy_transforms(frame_size: int = 224):
+def get_heavy_transforms(frame_size: int = 224, aug_generalize: bool = False):
     """
     Minority-class augmentation — uses the same cross-domain pipeline as the
     standard training transform.  Kept identical (Fix 1) to prevent
     augmentation-artifact shortcut learning where the model treats a
     transformation as a class cue.
     """
-    return _build_train_pipeline(frame_size)
+    return _build_train_pipeline(frame_size, aug_generalize=aug_generalize)
 
 
-def get_real_aug_transforms(frame_size: int = 224):
+def get_real_aug_transforms(frame_size: int = 224, aug_generalize: bool = False):
     """
     Real-video training augmentation: standard pipeline plus low-probability
     RandomGrayscale.
@@ -158,7 +213,7 @@ def get_real_aug_transforms(frame_size: int = 224):
       become a class-conditional shortcut ("grayscale = real").  At p=0.1 the
       augmentation is unpredictable and cannot be used as a cue.
     """
-    return transforms.Compose([
+    seq = [
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.ColorJitter(
@@ -168,6 +223,9 @@ def get_real_aug_transforms(frame_size: int = 224):
             hue=0.03,
         ),
         transforms.RandomGrayscale(p=0.1),
+    ]
+    seq += _maybe_downscale(aug_generalize)   # Phase 46 (OFF = no-op, byte-identical)
+    seq += [
         RandomJPEGCompression(p=0.30, q_lo=40, q_hi=80),
         transforms.RandomApply(
             [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))],
@@ -178,7 +236,8 @@ def get_real_aug_transforms(frame_size: int = 224):
         transforms.RandomErasing(
             p=0.10, scale=(0.02, 0.05), ratio=(0.3, 3.3), value=0.0,
         ),
-    ])
+    ]
+    return transforms.Compose(seq)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,70 +273,94 @@ class _AddGaussianNoise:
         return f"_AddGaussianNoise(sigma=[{self.sigma_lo},{self.sigma_hi}])"
 
 
-def _domain_0_clean(frame_size: int = 224):
-    return transforms.Compose([
+# Phase 46: each domain inserts RandomDownscale right after the flip (a PIL-level
+# op, before the domain's signature degradation) when aug_generalize is on.  The
+# downscale is applied uniformly across ALL four domains, so it adds resolution
+# variety WITHOUT becoming a domain cue (it cannot leak the DANN domain label).
+# OFF (default) = byte-identical to the P45 baseline domain pipelines.
+
+def _domain_0_clean(frame_size: int = 224, aug_generalize: bool = False):
+    seq = [
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
+    ]
+    seq += _maybe_downscale(aug_generalize)
+    seq += [
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
-    ])
+    ]
+    return transforms.Compose(seq)
 
 
-def _domain_1_heavy_jpeg(frame_size: int = 224):
-    return transforms.Compose([
+def _domain_1_heavy_jpeg(frame_size: int = 224, aug_generalize: bool = False):
+    seq = [
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
+    ]
+    seq += _maybe_downscale(aug_generalize)
+    seq += [
         # Always JPEG-compress; quality 30-50 = visibly degraded codec
         RandomJPEGCompression(p=1.0, q_lo=30, q_hi=50),
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
-    ])
+    ]
+    return transforms.Compose(seq)
 
 
-def _domain_2_noise(frame_size: int = 224):
-    return transforms.Compose([
+def _domain_2_noise(frame_size: int = 224, aug_generalize: bool = False):
+    seq = [
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
+    ]
+    seq += _maybe_downscale(aug_generalize)
+    seq += [
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
         _AddGaussianNoise(sigma_lo=0.05, sigma_hi=0.10),
-    ])
+    ]
+    return transforms.Compose(seq)
 
 
-def _domain_3_blur(frame_size: int = 224):
-    return transforms.Compose([
+def _domain_3_blur(frame_size: int = 224, aug_generalize: bool = False):
+    seq = [
         transforms.Resize((frame_size, frame_size)),
         transforms.RandomHorizontalFlip(p=0.5),
+    ]
+    seq += _maybe_downscale(aug_generalize)
+    seq += [
         # Always blur with kernel 5 and sigma 1.0-2.0 (stronger than the
         # standard p=0.1 sigma 0.1-1.0 used in _build_train_pipeline).
         transforms.GaussianBlur(kernel_size=5, sigma=(1.0, 2.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=_MEAN, std=_STD),
-    ])
+    ]
+    return transforms.Compose(seq)
 
 
-def get_domain_transform(domain_id: int, frame_size: int = 224):
+def get_domain_transform(domain_id: int, frame_size: int = 224,
+                         aug_generalize: bool = False):
     """Return the domain-id-conditioned train transform.
 
     Used in data/HiDF_datasets.py when Phase-27 DANN is enabled:
         domain_id = random.randint(0, num_domains-1)
-        aug       = get_domain_transform(domain_id, frame_size)
+        aug       = get_domain_transform(domain_id, frame_size,
+                                         aug_generalize=config.generalize_aug)
 
     Falls back to the standard train pipeline for any unknown domain_id
     (defensive — should not happen in normal use).
     """
     if domain_id == 0:
-        return _domain_0_clean(frame_size)
+        return _domain_0_clean(frame_size, aug_generalize=aug_generalize)
     if domain_id == 1:
-        return _domain_1_heavy_jpeg(frame_size)
+        return _domain_1_heavy_jpeg(frame_size, aug_generalize=aug_generalize)
     if domain_id == 2:
-        return _domain_2_noise(frame_size)
+        return _domain_2_noise(frame_size, aug_generalize=aug_generalize)
     if domain_id == 3:
-        return _domain_3_blur(frame_size)
-    return _build_train_pipeline(frame_size)
+        return _domain_3_blur(frame_size, aug_generalize=aug_generalize)
+    return _build_train_pipeline(frame_size, aug_generalize=aug_generalize)
 
 
-def get_transforms(mode: str, frame_size: int = 224):
+def get_transforms(mode: str, frame_size: int = 224, aug_generalize: bool = False):
     """
     Return a torchvision transform pipeline for the given split.
 
@@ -295,8 +378,8 @@ def get_transforms(mode: str, frame_size: int = 224):
         of shape (3, frame_size, frame_size).
     """
     if mode == "train":
-        t = _build_train_pipeline(frame_size)
-        print(f"[get_transforms] train pipeline: {t}")
+        t = _build_train_pipeline(frame_size, aug_generalize=aug_generalize)
+        print(f"[get_transforms] train pipeline (aug_generalize={aug_generalize}): {t}")
         return t
     # val and test: deterministic resize + normalise only
     return transforms.Compose([

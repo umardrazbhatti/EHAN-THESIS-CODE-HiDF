@@ -336,6 +336,15 @@ class EAHNConfig:
     # the new contribution-space del/ins.  0.0 = byte-identical Phase 44.
     lambda_aeh_sigconc:    float = 0.0  # weight on the signed-sum top-k capture loss
     aeh_sigconc_topk_frac: float = 0.15 # top-k fraction for it (0.15 = top ~7 of 49)
+
+    # Phase 46: cross-domain generalization via resolution-downscale augmentation.
+    # When True, every TRAIN augmentation path (incl. the Phase-27 DANN domains)
+    # inserts a RandomDownscale (downscale to 0.3-0.7x then upscale back), adding
+    # the resolution-loss axis the DANN domains never covered so the detector
+    # learns generic, transferable artifacts instead of the HiDF pixel fingerprint.
+    # OFF (default) = augmentation pipelines byte-identical to the P45 baseline.
+    generalize_aug:        bool  = False
+
     bidirectional_enabled:  bool  = True  # Phase 25: re-wire CrossAttentionFusion as the refined M_t
                                           # path.  M_t_used = α * M_t_refined + (1-α) * M_t_early, with
                                           # α = sigmoid(refine_gate).  Phase 26: refine_gate init
@@ -859,6 +868,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aeh_sigconc_topk_frac", type=float, default=None,
                         help="Phase 45: top-k fraction for --lambda_aeh_sigconc "
                              "(0.15 = top ~7 of 49 cells).")
+    parser.add_argument("--generalize_aug", dest="generalize_aug",
+                        action="store_true", default=None,
+                        help="Phase 46: cross-domain generalization. Insert a "
+                             "RandomDownscale (0.3-0.7x then upscale) into every TRAIN "
+                             "augmentation path incl. the DANN domains -> adds the "
+                             "resolution-loss axis the domains never covered so the "
+                             "detector learns transferable artifacts (cross-dataset "
+                             "fake recall). OFF (default) = byte-identical P45.")
     parser.add_argument("--bidirectional_enabled", dest="bidirectional_enabled",
                         action="store_true", default=None,
                         help="Phase 25: enable bi-directional refinement — CrossAttentionFusion "

@@ -414,6 +414,27 @@ class ExplanationMetrics:
         _pack("aeh",     ins_p,  del_p,  ins_pr, del_pr)
         _pack("blended", bl_ins, bl_del, bl_insr, bl_delr)
 
+        # Phase 46: store the MEAN curves (small: Ncells+1 points) so the
+        # insertion/deletion figure is plottable WITHOUT re-running the model.
+        _fk = (labels == 1) if (labels is not None and (labels == 1).any()) else None
+        def _mc(mat, fake=False):
+            m = mat[_fk] if (fake and _fk is not None) else mat
+            return m.mean(axis=0).tolist()
+        out["curve_fraction"]              = (_np.arange(Nc + 1) / Nc).tolist()
+        out["aeh_insertion_curve"]         = _mc(ins_p)
+        out["aeh_deletion_curve"]          = _mc(del_p)
+        out["aeh_insertion_curve_rand"]    = _mc(ins_pr)
+        out["aeh_deletion_curve_rand"]     = _mc(del_pr)
+        out["blended_insertion_curve"]     = _mc(bl_ins)
+        out["blended_deletion_curve"]      = _mc(bl_del)
+        if _fk is not None:
+            out["aeh_insertion_curve_fake"]     = _mc(ins_p,  True)
+            out["aeh_deletion_curve_fake"]      = _mc(del_p,  True)
+            out["aeh_insertion_curve_rand_fake"]= _mc(ins_pr, True)
+            out["aeh_deletion_curve_rand_fake"] = _mc(del_pr, True)
+            out["blended_insertion_curve_fake"] = _mc(bl_ins, True)
+            out["blended_deletion_curve_fake"]  = _mc(bl_del, True)
+
         if verbose:
             print(f"\n  [Contribution-space del/ins] N={N} (fake={out['n_fake']}), "
                   f"cells={Nc}, gamma={g:.2f}  (ANALYTIC -- all samples, exact)")

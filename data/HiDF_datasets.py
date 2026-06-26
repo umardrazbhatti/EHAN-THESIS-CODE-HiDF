@@ -81,7 +81,8 @@ class DeepfakeDataset(Dataset):
         self.config       = config
         self.mode         = mode
         self.dataset_type = dataset_type
-        self.transform    = get_transforms(mode, config.frame_size)
+        self.transform    = get_transforms(mode, config.frame_size,
+                                            aug_generalize=getattr(config, "generalize_aug", False))
         # Clean (val-style) transform — used by consistency regularization in train mode
         self.clean_transform = get_transforms("val", config.frame_size)
         self.heavy_aug: bool = False
@@ -526,13 +527,15 @@ class DeepfakeDataset(Dataset):
         _dann_enabled  = bool(getattr(self.config, "dann_enabled", False))
         _num_domains   = int(getattr(self.config, "num_domains", 4))
         domain_id      = -1                   # sentinel for non-train branches
+        _gen_aug = getattr(self.config, "generalize_aug", False)   # Phase 46
         if self.mode == "train" and _dann_enabled:
             domain_id = random.randint(0, _num_domains - 1)
-            aug = get_domain_transform(domain_id, self.config.frame_size)
+            aug = get_domain_transform(domain_id, self.config.frame_size,
+                                       aug_generalize=_gen_aug)
         elif self.mode == "train" and self.heavy_aug and label == self.minority_class:
-            aug = get_heavy_transforms(self.config.frame_size)
+            aug = get_heavy_transforms(self.config.frame_size, aug_generalize=_gen_aug)
         elif self.mode == "train" and label == 0:
-            aug = get_real_aug_transforms(self.config.frame_size)
+            aug = get_real_aug_transforms(self.config.frame_size, aug_generalize=_gen_aug)
         else:
             aug = self.transform
 

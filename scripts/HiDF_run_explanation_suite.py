@@ -592,6 +592,98 @@ def run_explanation_suite(
         except Exception as _e:
             print(f"[ExplanationSuite] (faithfulness_report write skipped: {_e})")
 
+    # ── Phase 46: paper figures + corrected numbers (eval-only, fully guarded) ──
+    # Past runs crashed on a cosmetic plot AFTER all metrics were saved, so every
+    # figure here is in its own try/except and NEVER aborts the run.
+    _fig_dir = Path(output_path).parent
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as _plt
+
+        # (1) Contribution-space insertion/deletion curve (the headline faithfulness fig)
+        if contribution_di and "curve_fraction" in contribution_di:
+            xs = contribution_di["curve_fraction"]
+            def _g(k):
+                return contribution_di.get(k)
+            fig, ax = _plt.subplots(1, 2, figsize=(11, 4.2))
+            # prefer fake-only curves; fall back to all-sample
+            ins_s = _g("blended_insertion_curve_fake") or _g("blended_insertion_curve")
+            ins_r = _g("aeh_insertion_curve_rand_fake") or _g("aeh_insertion_curve_rand")
+            ins_h = _g("aeh_insertion_curve_fake") or _g("aeh_insertion_curve")
+            del_s = _g("blended_deletion_curve_fake") or _g("blended_deletion_curve")
+            del_r = _g("aeh_deletion_curve_rand_fake") or _g("aeh_deletion_curve_rand")
+            del_h = _g("aeh_deletion_curve_fake") or _g("aeh_deletion_curve")
+            if ins_h: ax[0].plot(xs, ins_h, "-",  color="C0", label="head saliency")
+            if ins_s: ax[0].plot(xs, ins_s, "--", color="C2", label="deployed (blended)")
+            if ins_r: ax[0].plot(xs, ins_r, ":",  color="C3", label="random order")
+            ax[0].set_title("Insertion (fake) — higher = better")
+            ax[0].set_xlabel("fraction of cells inserted"); ax[0].set_ylabel("P(fake)")
+            ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3)
+            if del_h: ax[1].plot(xs, del_h, "-",  color="C0", label="head saliency")
+            if del_s: ax[1].plot(xs, del_s, "--", color="C2", label="deployed (blended)")
+            if del_r: ax[1].plot(xs, del_r, ":",  color="C3", label="random order")
+            ax[1].set_title("Deletion (fake) — lower = better")
+            ax[1].set_xlabel("fraction of cells deleted"); ax[1].set_ylabel("P(fake)")
+            ax[1].legend(fontsize=8); ax[1].grid(alpha=0.3)
+            fig.suptitle("Contribution-space faithfulness (additive head, all fakes)")
+            fig.tight_layout()
+            fig.savefig(_fig_dir / "contribution_del_ins_curve.png", dpi=140)
+            _plt.close(fig)
+            print(f"[ExplanationSuite] figure -> contribution_del_ins_curve.png")
+    except Exception as _e:
+        print(f"[ExplanationSuite] (contribution curve figure skipped: {_e})")
+
+    try:
+        if road and isinstance(road, dict):
+            import matplotlib; matplotlib.use("Agg")
+            import matplotlib.pyplot as _plt
+            fig, ax = _plt.subplots(figsize=(6, 4.2))
+            for _nm, _c in (("intrinsic", "C0"), ("gradient", "C1"), ("random", "C3")):
+                _e2 = road.get(_nm)
+                if isinstance(_e2, dict) and _e2.get("curve"):
+                    cv = _e2["curve"]
+                    xs = [i / (len(cv) - 1) for i in range(len(cv))]
+                    ax.plot(xs, cv, label=f"{_nm} (AUC {_e2.get('auc', 0):.3f})",
+                            color=_c)
+            ax.set_title("ROAD — debiased deletion (lower curve = more faithful)")
+            ax.set_xlabel("fraction removed"); ax.set_ylabel("P(fake)")
+            ax.legend(fontsize=8); ax.grid(alpha=0.3)
+            fig.tight_layout(); fig.savefig(_fig_dir / "road_curve.png", dpi=140)
+            _plt.close(fig)
+            print(f"[ExplanationSuite] figure -> road_curve.png")
+    except Exception as _e:
+        print(f"[ExplanationSuite] (ROAD figure skipped: {_e})")
+
+    try:
+        import csv as _csv
+        _intr = result.get("intrinsic", {})
+        _hl   = result.get("faithfulness_headline", {})
+        with open(_fig_dir / "faithfulness_summary.csv", "w", newline="",
+                  encoding="ascii", errors="replace") as _f:
+            _w = _csv.writer(_f)
+            _w.writerow(["metric", "value", "note"])
+            _w.writerow(["faithful_contribution_space", _hl.get("faithful", ""),
+                         "saliency beats random on ins AND del (fakes)"])
+            _w.writerow(["blended_insertion_fake", _hl.get("blended_ins_fake", ""), "higher=better"])
+            _w.writerow(["blended_deletion_fake",  _hl.get("blended_del_fake", ""), "lower=better"])
+            _w.writerow(["blended_ins_gain", _hl.get("blended_ins_gain", ""), ">0=faithful"])
+            _w.writerow(["blended_del_gain", _hl.get("blended_del_gain", ""), ">0=faithful"])
+            _w.writerow(["head_insertion_fake", _hl.get("head_ins_fake", ""), "intrinsic head"])
+            _w.writerow(["head_deletion_fake",  _hl.get("head_del_fake", ""), "intrinsic head"])
+            _w.writerow(["faithfulness_corr", _intr.get("faithfulness_corr", ""), "saliency vs gradient"])
+            _w.writerow(["temporal_ssim", _intr.get("temporal_ssim", ""), "map stability"])
+            _w.writerow(["peak_mode_share", _intr.get("peak_mode_share", ""), "concentration"])
+            _w.writerow(["m_t_std_mean", _intr.get("m_t_std_mean", ""), "spatial sharpness"])
+            _w.writerow(["n_fake", _hl.get("n_fake", ""), "samples in contribution metric"])
+            _w.writerow(["pixel_occlusion_ins_CONFOUNDED", _intr.get("insertion_auc", ""),
+                         "secondary/confounded -- do not headline"])
+            _w.writerow(["pixel_occlusion_del_CONFOUNDED", _intr.get("deletion_auc", ""),
+                         "secondary/confounded -- do not headline"])
+        print(f"[ExplanationSuite] table -> faithfulness_summary.csv")
+    except Exception as _e:
+        print(f"[ExplanationSuite] (faithfulness_summary csv skipped: {_e})")
+
     # ── Save JSON ─────────────────────────────────────────────────────────────
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

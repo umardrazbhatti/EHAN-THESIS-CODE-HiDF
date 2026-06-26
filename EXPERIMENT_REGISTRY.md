@@ -140,12 +140,14 @@ limitation and the primary target of the next runs.
 
 ## Improvement roadmap (staged, one axis per run)
 
-1. **EXP2 → generalization run (next):** add a data-generalization augmentation block
-   (resolution downscale / "reduce pixels", stronger blur+JPEG, optional stronger SBI)
-   to lift cross-dataset fake recall, **keeping `sigconc 0.15`** and verifying
-   contribution-space faithfulness survives (the additive head makes faithfulness
-   structural, so heavy aug should not destroy it — the bet that breaks the old
-   aug-vs-explanation trade-off). Also land the paper-asset figure fixes here.
+1. **EXP2 → generalization run — ✅ BUILT (`Exp_A_p46_generalize_g80`, Phase 46):**
+   added `--generalize_aug` = a `RandomDownscale` (0.3–0.7×) inserted into every train
+   path **including all 4 DANN domains** (the active path — DANN is ON, so the standard
+   pipeline was dead; this catch was verified before build). Keeps `sigconc 0.15`,
+   calibration, freq, moderate SBI. Default-OFF byte-identical; smoke-green. Paper-asset
+   fixes landed in the same change (del/ins curve export + `contribution_del_ins_curve.png`
+   + `road_curve.png` + `faithfulness_summary.csv`). **Targets:** cross-dataset fake recall
+   up, in-dist AUC ≥0.95, contribution-space faithful stays YES. Run it next.
 2. **EXP3 → fix operating point** (threshold/checkpoint pick) + moderate generalization;
    keep it as the sharp-explanation model.
 3. **EXP1 → control**, re-scored honestly (threshold) — kept as the no-lever reference.
