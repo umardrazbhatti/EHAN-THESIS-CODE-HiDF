@@ -592,6 +592,39 @@ def run_explanation_suite(
         except Exception as _e:
             print(f"[ExplanationSuite] (faithfulness_report write skipped: {_e})")
 
+        # Phase 47: make eval/report.txt SELF-CONSISTENT. That file's
+        # 'Explanation quality' section prints the pixel-occlusion proxy
+        # (Insertion/Deletion AUC ~0.5) which readers keep mistaking for the
+        # headline. Append the authoritative contribution-space numbers so the
+        # same file shows both, with the correct one clearly marked. Guarded.
+        try:
+            _rep = Path(output_path).parent / "eval" / "report.txt"
+            if _rep.exists():
+                _foot = [
+                    "",
+                    "=========== AUTHORITATIVE EXPLANATION FAITHFULNESS ===========",
+                    "The 'Insertion/Deletion AUC' under 'Explanation quality' above",
+                    "are the PIXEL-OCCLUSION proxy -- confounded for this additive-",
+                    "head model and computed on only ~24 fakes. The CORRECT metric",
+                    "is contribution-space del/ins on ALL %d fakes:" % headline["n_fake"],
+                    "  Insertion (fake): %.3f blended / %.3f head   (higher=better)"
+                        % (headline["blended_ins_fake"], headline["head_ins_fake"]),
+                    "  Deletion  (fake): %.3f blended / %.3f head   (lower=better)"
+                        % (headline["blended_del_fake"], headline["head_del_fake"]),
+                    "  Gain vs random  : +%.3f ins / +%.3f del  (>0 => faithful,"
+                        % (headline["blended_ins_gain"], headline["blended_del_gain"]),
+                    "                    not just the additive structure)",
+                    "  FAITHFUL? %s" % ("YES" if headline["faithful"] else "NO"),
+                    "  (detail: faithfulness_report.txt ; explanation_metrics.json"
+                    " -> contribution_space)",
+                    "=============================================================",
+                ]
+                with open(_rep, "a", encoding="ascii", errors="replace") as _f:
+                    _f.write("\n".join(_foot) + "\n")
+                print("[ExplanationSuite] appended authoritative headline to eval/report.txt")
+        except Exception as _e:
+            print(f"[ExplanationSuite] (report.txt headline append skipped: {_e})")
+
     # ── Phase 46: paper figures + corrected numbers (eval-only, fully guarded) ──
     # Past runs crashed on a cosmetic plot AFTER all metrics were saved, so every
     # figure here is in its own try/except and NEVER aborts the run.
