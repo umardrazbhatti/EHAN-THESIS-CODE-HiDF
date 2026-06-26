@@ -777,6 +777,17 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     if not _fdr_lines:
         _fdr_lines = "  (not computed)\n"
 
+    # Phase 45: for the additive head the pixel-occlusion del/ins below is a
+    # CONFOUNDED proxy (a globally-mixed transformer re-globalises occluded
+    # pixels). Mark it as a proxy and defer to the authoritative contribution-
+    # space verdict (eval/faithfulness_report.txt, written by the explanation
+    # suite). Non-additive runs keep the original wording byte-for-byte.
+    _aeh_on = bool(getattr(model, "aeh_enabled", False))
+    _faith_label = "Faithful? (pixel-occ proxy) " if _aeh_on else "Faithful? "
+    _faith_ptr = ("  >> AUTHORITATIVE additive-head faithfulness: eval/faithfulness_report.txt\n"
+                  "     (contribution space, ALL fakes; the pixel proxy is confounded here)\n"
+                  ) if _aeh_on else ""
+
     report = (
         "EAHN Detection Report\n"
         "---------------------\n"
@@ -797,7 +808,8 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         f"  Faithfulness corr    : {faithful_corr:.3f}  (gradient vs. intrinsic)\n"
         f"  Insertion AUC        : {ins_auc:.4f}  (higher = better)\n"
         f"  Deletion AUC         : {del_auc:.4f}  (lower = better)\n"
-        f"  Faithful? {faithful_str}\n"
+        f"  {_faith_label}{faithful_str}\n"
+        f"{_faith_ptr}"
         f"\n"
         f"Del/Ins confidence curve:\n"
         f"  10% removed  → del_conf={_d10s}  ins_conf={_i10s}\n"

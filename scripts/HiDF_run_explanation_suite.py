@@ -529,6 +529,69 @@ def run_explanation_suite(
                 print(f"  ROAD {_nm:<9} AUC={_e['auc']:.4f}  gain_vs_rand={_gain:+.4f}  "
                       f"drop@10%={_d10:+.4f}  drop@50%={_d50:+.4f}")
 
+    # ── Phase 45: authoritative faithfulness headline (contribution space) ──────
+    # The eval/report.txt 'Faithful?' line uses a pixel-occlusion proxy that is
+    # CONFOUNDED for the additive head (a globally-mixed transformer re-globalises
+    # occluded pixels, and it ran on only ~24 fakes). The contribution-space
+    # del/ins is the EXACT, all-fakes readout the head was built for. We record it
+    # as the authoritative verdict (in the JSON + a human-readable file) so the
+    # head's faithfulness can never be mis-reported again. Faithful == the head's
+    # own saliency ordering beats a RANDOM ordering on BOTH insertion and deletion
+    # of fakes (gain > 0 on both) -> the saliency causally drives the prediction.
+    if contribution_di:
+        def _cs_gain(_pre, _ax):
+            return contribution_di.get(f"{_pre}_{_ax}_gain_fake_only",
+                   contribution_di.get(f"{_pre}_{_ax}_gain_over_random", 0.0))
+        _bl_ig, _bl_dg = _cs_gain("blended", "ins"), _cs_gain("blended", "del")
+        _ah_ig, _ah_dg = _cs_gain("aeh", "ins"),     _cs_gain("aeh", "del")
+        _bl_ok = bool(_bl_ig > 0.0 and _bl_dg > 0.0)
+        _ah_ok = bool(_ah_ig > 0.0 and _ah_dg > 0.0)
+        headline = {
+            "faithful":          bool(_bl_ok or _ah_ok),
+            "faithful_blended":  _bl_ok,
+            "faithful_head":     _ah_ok,
+            "blended_ins_fake":  contribution_di.get("blended_insertion_auc_fake_only", 0.0),
+            "blended_del_fake":  contribution_di.get("blended_deletion_auc_fake_only", 0.0),
+            "blended_ins_gain":  _bl_ig, "blended_del_gain": _bl_dg,
+            "head_ins_fake":     contribution_di.get("aeh_insertion_auc_fake_only", 0.0),
+            "head_del_fake":     contribution_di.get("aeh_deletion_auc_fake_only", 0.0),
+            "head_ins_gain":     _ah_ig, "head_del_gain": _ah_dg,
+            "n_fake":            contribution_di.get("n_fake", -1),
+            "gamma":             contribution_di.get("gamma", 0.0),
+            "basis":             "contribution-space (analytic, all fakes)",
+        }
+        result["faithfulness_headline"] = headline
+        try:
+            _fr = Path(output_path).parent / "faithfulness_report.txt"
+            _v  = "YES -- saliency causally drives the prediction" if headline["faithful"] else "NO"
+            _lines = [
+                "EAHN Additive-Head Faithfulness (AUTHORITATIVE, contribution space)",
+                "=" * 66,
+                "Evaluated in the head's EXACT contribution space (analytic, ALL %d fakes)."
+                    % headline["n_fake"],
+                "Supersedes the pixel-occlusion 'Faithful?' line in eval/report.txt, which is",
+                "confounded for a globally-mixed transformer.",
+                "",
+                "Deployed model (blended logit, gamma=%.2f):" % headline["gamma"],
+                "  Insertion AUC (fake) : %.3f   (higher = better)" % headline["blended_ins_fake"],
+                "  Deletion  AUC (fake) : %.3f   (lower  = better)" % headline["blended_del_fake"],
+                "  Ins gain over random : %+.3f" % headline["blended_ins_gain"],
+                "  Del gain over random : %+.3f" % headline["blended_del_gain"],
+                "Pure additive head:",
+                "  Insertion AUC (fake) : %.3f" % headline["head_ins_fake"],
+                "  Deletion  AUC (fake) : %.3f" % headline["head_del_fake"],
+                "  Ins / Del gain       : %+.3f / %+.3f"
+                    % (headline["head_ins_gain"], headline["head_del_gain"]),
+                "",
+                "FAITHFUL? %s" % _v,
+            ]
+            with open(_fr, "w", encoding="ascii", errors="replace") as _f:
+                _f.write("\n".join(_lines) + "\n")
+            print(f"[ExplanationSuite] faithfulness_report.txt -> {_fr}")
+            print(f"[ExplanationSuite] AUTHORITATIVE Faithful? {_v}")
+        except Exception as _e:
+            print(f"[ExplanationSuite] (faithfulness_report write skipped: {_e})")
+
     # ── Save JSON ─────────────────────────────────────────────────────────────
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
